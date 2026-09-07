@@ -3,6 +3,7 @@
 // DriveSync (dsync) — https://github.com/scaleninja/drivesync
 
 //! Local walking, remote/local comparison, and the push/pull engines.
+use crate::cache::Cache;
 use crate::config::{GD_DIR, IGNORE_FILE};
 use crate::drive::Drive;
 use crate::progress::{self, Spinner};
@@ -46,6 +47,11 @@ pub fn fmt_ms(ms: i64) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// Drive allows names that cannot be mapped onto a local path ("/", ".", "..", empty).
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
 pub fn join_rel(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
         name.to_string()
@@ -83,11 +89,16 @@ pub fn rel_path(root: &Path, abs: &Path) -> Result<String> {
             root.display()
         )
     })?;
-    Ok(rel
+    let parts = rel
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/"))
+        .map(|c| {
+            c.as_os_str()
+                .to_str()
+                .map(String::from)
+                .with_context(|| format!("{} is not valid UTF-8", abs.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.join("/"))
 }
 
 pub fn load_ignore(root: &Path) -> Gitignore {
@@ -95,7 +106,16 @@ pub fn load_ignore(root: &Path) -> Gitignore {
     gi
 }
 
+pub const PART_SUFFIX: &str = ".dsync-part";
+
 fn is_ignored(root: &Path, ignore: &Gitignore, path: &Path, is_dir: bool) -> bool {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(PART_SUFFIX))
+    {
+        return true; // leftover from an interrupted download
+    }
     path.strip_prefix(root)
         .ok()
         .and_then(|r| r.components().next())
@@ -134,8 +154,15 @@ pub fn local_walk(
         } else {
             None
         };
+        let rel = match rel_path(root, entry.path()) {
+            Ok(rel) => rel,
+            Err(e) => {
+                progress::eprintln(&format!("! skip     {e:#}"));
+                continue;
+            }
+        };
         out.insert(
-            rel_path(root, entry.path())?,
+            rel,
             Entry {
                 mtime_ms,
                 md5,
@@ -209,13 +236,6 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn path(&self) -> &str {
-        match self {
-            Action::Mkdir { path }
-            | Action::Upload { path, .. }
-            | Action::Download { path, .. } => path,
-        }
-    }
     pub fn describe(&self) -> String {
         match self {
             Action::Mkdir { path } => format!("+ mkdir    {path}/"),
@@ -371,87 +391,140 @@ fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
 }
 
-/// Execute a push plan: folders first (sequentially), then file uploads in parallel.
-/// `remote` is updated with the resulting files so it can be cached. Returns the number of failures.
+/// Execute a push plan. Folders are created level by level, each level in parallel; then file
+/// uploads run in parallel. Every completed action is recorded in the cache immediately, so a
+/// cancelled push resumes cleanly. Returns the number of failures.
 pub fn exec_push(
     drive: &Drive,
+    cache: &Cache,
     root: &Path,
     base_rel: &str,
     base_id: &str,
     actions: Vec<Action>,
-    remote: &mut BTreeMap<String, Entry>,
     threads: usize,
 ) -> Result<usize> {
-    let mut folder_ids: BTreeMap<String, String> = remote
-        .iter()
+    let mut folder_ids: BTreeMap<String, String> = cache
+        .load(base_rel)?
+        .into_iter()
         .filter(|(_, e)| e.is_dir)
-        .filter_map(|(p, e)| Some((p.clone(), e.id.clone()?)))
+        .filter_map(|(p, e)| Some((p, e.id?)))
         .collect();
     folder_ids.insert(base_rel.to_string(), base_id.to_string());
+    let mut failures = 0;
+
+    // Phase 1: folders, grouped by depth. Every folder at one level has its parent from the level above.
+    let mut levels: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut uploads = Vec::new();
     for a in actions {
-        let parent_id = folder_ids
-            .get(parent_of(a.path()))
-            .cloned()
-            .with_context(|| format!("no remote parent folder for {}", a.path()))?;
         match a {
-            Action::Mkdir { path } => {
-                let f = drive.create_folder(&parent_id, path.rsplit('/').next().unwrap())?;
-                progress::println(&format!("+ mkdir    {path}/"));
-                folder_ids.insert(path.clone(), f.id.clone());
-                remote.insert(path, f.to_entry());
-            }
+            Action::Mkdir { path } => levels
+                .entry(path.matches('/').count())
+                .or_default()
+                .push(path),
             Action::Upload {
                 path,
                 existing_id,
                 mtime_ms,
-            } => uploads.push((path, parent_id, existing_id, mtime_ms)),
+            } => uploads.push((path, existing_id, mtime_ms)),
             Action::Download { .. } => unreachable!(),
         }
     }
-    let total = uploads.len();
+    let total_dirs: usize = levels.values().map(Vec::len).sum();
+    if total_dirs > 0 {
+        let done = AtomicUsize::new(0);
+        let spinner = Spinner::start(&format!(
+            "Creating folders 0/{total_dirs} ({threads} streams)"
+        ));
+        for paths in levels.into_values() {
+            let mut batch = Vec::new();
+            for path in paths {
+                match folder_ids.get(parent_of(&path)) {
+                    Some(parent_id) => batch.push((path, parent_id.clone())),
+                    None => {
+                        progress::eprintln(&format!(
+                            "x failed   {path}/: parent folder was not created"
+                        ));
+                        failures += 1;
+                    }
+                }
+            }
+            let results = parallel(batch, threads, |(path, parent_id)| {
+                let result = drive.create_folder(&parent_id, path.rsplit('/').next().unwrap());
+                match &result {
+                    Ok(f) => {
+                        if let Err(e) = cache.upsert(&path, &f.to_entry()) {
+                            progress::eprintln(&format!(
+                                "warning: cache update failed for {path}: {e:#}"
+                            ));
+                        }
+                        progress::println(&format!("+ mkdir    {path}/"));
+                    }
+                    Err(e) => progress::eprintln(&format!("x failed   {path}/: {e:#}")),
+                }
+                spinner.set(format!(
+                    "Creating folders {}/{total_dirs} ({threads} streams)",
+                    done.fetch_add(1, Ordering::SeqCst) + 1
+                ));
+                (path, result)
+            });
+            for (path, r) in results {
+                match r {
+                    Ok(f) => {
+                        folder_ids.insert(path, f.id);
+                    }
+                    Err(_) => failures += 1,
+                }
+            }
+        }
+        spinner.finish();
+    }
+
+    // Phase 2: files, in parallel. Skip anything whose parent folder failed to be created.
+    let mut jobs = Vec::new();
+    for (path, existing_id, mtime_ms) in uploads {
+        match folder_ids.get(parent_of(&path)) {
+            Some(parent_id) => jobs.push((path, parent_id.clone(), existing_id, mtime_ms)),
+            None => {
+                progress::eprintln(&format!("x failed   {path}: parent folder was not created"));
+                failures += 1;
+            }
+        }
+    }
+    let total = jobs.len();
     let done = AtomicUsize::new(0);
     let spinner = Spinner::start(&format!("Uploading 0/{total} ({threads} streams)"));
-    let results = parallel(
-        uploads,
-        threads,
-        |(path, parent_id, existing_id, mtime_ms)| {
-            let result = drive.upload(
-                &parent_id,
-                path.rsplit('/').next().unwrap(),
-                existing_id.as_deref(),
-                &root.join(&path),
-                &fmt_ms(mtime_ms),
-            );
-            match &result {
-                Ok(_) => progress::println(&format!(
+    let results = parallel(jobs, threads, |(path, parent_id, existing_id, mtime_ms)| {
+        let result = drive.upload(
+            &parent_id,
+            path.rsplit('/').next().unwrap(),
+            existing_id.as_deref(),
+            &root.join(&path),
+            &fmt_ms(mtime_ms),
+        );
+        match &result {
+            Ok(f) => {
+                if let Err(e) = cache.upsert(&path, &f.to_entry()) {
+                    progress::eprintln(&format!("warning: cache update failed for {path}: {e:#}"));
+                }
+                progress::println(&format!(
                     "^ {:<8} {path}",
                     if existing_id.is_some() {
                         "updated"
                     } else {
                         "uploaded"
                     }
-                )),
-                Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
+                ));
             }
-            spinner.set(format!(
-                "Uploading {}/{total} ({threads} streams)",
-                done.fetch_add(1, Ordering::SeqCst) + 1
-            ));
-            (path, result)
-        },
-    );
-    spinner.finish();
-    let mut failures = 0;
-    for (path, r) in results {
-        match r {
-            Ok(f) => {
-                remote.insert(path, f.to_entry());
-            }
-            Err(_) => failures += 1,
+            Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
         }
-    }
-    Ok(failures)
+        spinner.set(format!(
+            "Uploading {}/{total} ({threads} streams)",
+            done.fetch_add(1, Ordering::SeqCst) + 1
+        ));
+        result.is_err()
+    });
+    spinner.finish();
+    Ok(failures + results.into_iter().filter(|failed| *failed).count())
 }
 
 /// Execute a pull plan: local folders first, then downloads in parallel. Returns the number of failures.
@@ -657,6 +730,87 @@ mod tests {
         });
         assert_eq!(out, (0..100).map(|i| i * 2).collect::<Vec<_>>());
         assert!(seen.lock().unwrap().len() > 1);
+    }
+
+    #[test]
+    fn names_with_spaces_and_special_chars() {
+        let dir = std::env::temp_dir().join(format!("dsync_names_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = [
+            "My Documents/Q3 report (final).txt",
+            "My Documents/sub folder/it's 100%_done.md",
+            "  leading and trailing  /x.txt",
+            "ünïcödé 日本語/naïve café.txt",
+            "back\\slash/tab\there.txt",
+            "#hash and $dollar/a&b=c.txt",
+            "my logs/should be ignored.log",
+        ];
+        for n in names {
+            let p = dir.join(n);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, n.as_bytes()).unwrap();
+        }
+        std::fs::write(dir.join(IGNORE_FILE), "my logs/\n").unwrap();
+        let ignore = load_ignore(&dir);
+        let local = local_walk(&dir, &dir, -1, &ignore, true).unwrap();
+        for n in &names[..6] {
+            assert!(local.contains_key(*n), "missing {n}");
+            assert_eq!(
+                local[*n].md5.as_deref(),
+                Some(format!("{:x}", md5::compute(n.as_bytes())).as_str())
+            );
+        }
+        assert!(!local.contains_key("my logs/should be ignored.log"));
+        assert!(local["My Documents/sub folder"].is_dir);
+        // A subtree walk from a spaced directory keeps the full relative path.
+        let sub = local_walk(
+            &dir,
+            &dir.join("My Documents/sub folder"),
+            -1,
+            &ignore,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            sub.keys().cloned().collect::<Vec<_>>(),
+            vec!["My Documents/sub folder/it's 100%_done.md"]
+        );
+        // Planning and parent resolution keep the spaced components intact.
+        let remote = BTreeMap::new();
+        let (actions, _) = plan_push(&local, &remote, false);
+        let mkdirs: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Mkdir { .. }))
+            .map(|a| a.describe())
+            .collect();
+        assert!(mkdirs.contains(&"+ mkdir    My Documents/sub folder/".to_string()));
+        assert_eq!(
+            parent_of("My Documents/sub folder/it's 100%_done.md"),
+            "My Documents/sub folder"
+        );
+        assert_eq!(parent_of("top level.txt"), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_unmappable_remote_names() {
+        assert!(valid_name("normal name.txt"));
+        assert!(valid_name("  spaces  "));
+        assert!(!valid_name("a/b"));
+        assert!(!valid_name("."));
+        assert!(!valid_name(".."));
+        assert!(!valid_name(""));
+    }
+
+    #[test]
+    fn paths_with_spaces_and_dotdot() {
+        assert_eq!(
+            rel_path(Path::new("/r oot"), Path::new("/r oot/a b/c d.txt")).unwrap(),
+            "a b/c d.txt"
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolutize("a b/../c d").unwrap(), cwd.join("c d"));
+        assert_eq!(absolutize("/x y/./z").unwrap(), PathBuf::from("/x y/z"));
     }
 
     #[test]

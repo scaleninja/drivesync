@@ -361,6 +361,64 @@ impl Drive {
         }
     }
 
+    /// Resolve an alias such as `root` to the real file id.
+    pub fn file_id(&self, alias: &str) -> Result<String> {
+        let url = format!("{API}/{alias}");
+        let f: File = self
+            .send(&move |c| Ok(c.get(&url).query(&[("fields", FIELDS)])))?
+            .json()?;
+        Ok(f.id)
+    }
+
+    /// List the whole subtree under `root_id` with one paginated query over My Drive (rclone's
+    /// "fast list"): every non-trashed file comes back with its parent id, and the tree is assembled
+    /// locally. One request per 1000 files instead of one per folder.
+    pub fn list_tree(&self, root_id: &str, depth: i32) -> Result<BTreeMap<String, Entry>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Row {
+            #[serde(flatten)]
+            file: File,
+            #[serde(default)]
+            parents: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            next_page_token: Option<String>,
+            files: Vec<Row>,
+        }
+        let mut by_parent: BTreeMap<String, Vec<File>> = BTreeMap::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let pt = page_token.clone();
+            let page: Page = self
+                .send(&move |c| {
+                    let mut params = vec![
+                        ("q", "trashed = false".to_string()),
+                        ("fields", format!("nextPageToken,files({FIELDS},parents)")),
+                        ("pageSize", "1000".into()),
+                        ("spaces", "drive".into()),
+                    ];
+                    if let Some(pt) = &pt {
+                        params.push(("pageToken", pt.clone()));
+                    }
+                    Ok(c.get(API).query(&params))
+                })?
+                .json()?;
+            for row in page.files {
+                for parent in row.parents {
+                    by_parent.entry(parent).or_default().push(row.file.clone());
+                }
+            }
+            match page.next_page_token {
+                Some(t) => page_token = Some(t),
+                None => break,
+            }
+        }
+        Ok(assemble_tree(&by_parent, root_id, depth))
+    }
+
     /// Recursively list `folder_id` into `out`, keyed by relative path under `prefix`.
     pub fn walk(
         &self,
@@ -373,6 +431,13 @@ impl Drive {
             return Ok(());
         }
         for f in self.list_children(folder_id)? {
+            if !crate::sync::valid_name(&f.name) {
+                crate::progress::eprintln(&format!(
+                    "! skip     remote name {:?} cannot be a local path",
+                    f.name
+                ));
+                continue;
+            }
             let rel = crate::sync::join_rel(prefix, &f.name);
             if out.contains_key(&rel) {
                 continue; // Drive allows duplicate names; keep the first.
@@ -388,6 +453,41 @@ impl Drive {
     }
 }
 
+/// Build the relative-path map from a parent-id -> children index, breadth-first from `root_id`,
+/// honouring `depth`, skipping unmappable names and keeping the first of any duplicate names.
+fn assemble_tree(
+    by_parent: &BTreeMap<String, Vec<File>>,
+    root_id: &str,
+    depth: i32,
+) -> BTreeMap<String, Entry> {
+    let mut out = BTreeMap::new();
+    let mut frontier = vec![(root_id.to_string(), String::new(), depth)];
+    while let Some((id, prefix, remaining)) = frontier.pop() {
+        if remaining == 0 {
+            continue;
+        }
+        for f in by_parent.get(&id).into_iter().flatten() {
+            if !crate::sync::valid_name(&f.name) {
+                crate::progress::eprintln(&format!(
+                    "! skip     remote name {:?} cannot be a local path",
+                    f.name
+                ));
+                continue;
+            }
+            let rel = crate::sync::join_rel(&prefix, &f.name);
+            if out.contains_key(&rel) {
+                continue;
+            }
+            let entry = f.to_entry();
+            if entry.is_dir {
+                frontier.push((f.id.clone(), rel.clone(), remaining - 1));
+            }
+            out.insert(rel, entry);
+        }
+    }
+    out
+}
+
 /// Sleep 0.5 s, 1 s, 2 s, ... plus jitter before retrying `attempt + 1`.
 fn backoff(attempt: u32, why: &str) {
     let mut jitter = [0u8; 2];
@@ -400,4 +500,72 @@ fn backoff(attempt: u32, why: &str) {
 /// Escape a value for use inside single quotes in a Drive query.
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(id: &str, name: &str, folder: bool) -> File {
+        File {
+            id: id.into(),
+            name: name.into(),
+            mime_type: if folder {
+                FOLDER_MIME.into()
+            } else {
+                "text/plain".into()
+            },
+            modified_time: Some("2026-09-08T00:00:00.000Z".into()),
+            md5_checksum: (!folder).then(|| "abc".into()),
+        }
+    }
+
+    #[test]
+    fn query_escaping() {
+        assert_eq!(escape("it's"), "it\\'s");
+        assert_eq!(escape("back\\slash"), "back\\\\slash");
+        assert_eq!(escape("plain name with spaces"), "plain name with spaces");
+    }
+
+    #[test]
+    fn tree_assembly_handles_spaces_depth_duplicates_and_bad_names() {
+        let mut by_parent: BTreeMap<String, Vec<File>> = BTreeMap::new();
+        by_parent.insert(
+            "ROOT".into(),
+            vec![
+                file("d1", "My Documents", true),
+                file("f1", "top level.txt", false),
+                file("f1dup", "top level.txt", false),
+                file("bad", "with/slash.txt", false),
+                file("dot", ".", true),
+            ],
+        );
+        by_parent.insert(
+            "d1".into(),
+            vec![
+                file("d2", "sub folder", true),
+                file("f2", "it's 100%_done.md", false),
+            ],
+        );
+        by_parent.insert("d2".into(), vec![file("f3", "deep file.txt", false)]);
+        by_parent.insert("dot".into(), vec![file("f4", "unreachable.txt", false)]);
+
+        let all = assemble_tree(&by_parent, "ROOT", -1);
+        assert_eq!(
+            all.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "My Documents",
+                "My Documents/it's 100%_done.md",
+                "My Documents/sub folder",
+                "My Documents/sub folder/deep file.txt",
+                "top level.txt"
+            ]
+        );
+        assert_eq!(all["top level.txt"].id.as_deref(), Some("f1")); // first duplicate wins
+        assert!(all["My Documents/sub folder"].is_dir);
+
+        let shallow = assemble_tree(&by_parent, "ROOT", 2);
+        assert!(shallow.contains_key("My Documents/sub folder"));
+        assert!(!shallow.contains_key("My Documents/sub folder/deep file.txt"));
+    }
 }

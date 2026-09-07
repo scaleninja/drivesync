@@ -6,12 +6,18 @@ pulls a local directory to and from Google Drive and shows a diff of modificatio
 - Project: <https://github.com/scaleninja/drivesync>
 - License: [MIT](LICENSE)
 
+DriveSync (`dsync`) comes with ABSOLUTELY NO WARRANTY. This software is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.
+
+Usage:
+
 ```
 dsync init [DIR] --remote-folder PATH --depth N      # authorize + create .gd/ in DIR
 dsync push [PATH] [--force] [-y] [-j N] [--refresh]  # upload local changes (PATH relative to cwd)
 dsync pull [PATH] [--force] [-y] [-j N] [--refresh]  # download remote changes
 dsync diff [PATH] [--refresh]                        # list files whose local/remote mtimes differ
 dsync status                                         # local dir, remote folder, depth, cache, ignore file, token
+dsync update-cache [--refresh]                       # refresh the remote index only (for a quicker diff later)
 dsync version
 ```
 
@@ -122,7 +128,18 @@ dsync pull -y -j 16 # no prompt, 16 parallel streams
   `--refresh` forces a full re-listing (also done automatically if `depth` changed or the incremental
   update fails).
 - **Lock**: push and pull hold an exclusive lock on `.gd/lock`; a second instance waits for the first.
+- **Fresh pushes are fast**: missing folders are created level by level with all folders of a level in
+  parallel, then files upload in parallel. Full listings use one paginated query over My Drive instead of
+  one request per folder. Requests share an HTTP/2 connection.
+- **Resumable**: every completed folder creation and upload is recorded in the cache immediately, so a
+  push interrupted with Ctrl-C can be re-run and only the remaining files are planned. Drive writes are
+  atomic, so no partial files are ever left remotely; an interrupted download leaves only a
+  `.*.dsync-part` temp file, which is ignored and overwritten on the next pull.
 - **Ignore**: `.driveignore` in the sync root uses gitignore syntax. `.gd/` is always ignored.
+- **Names**: spaces, quotes, `%`, `_`, backslashes and Unicode in file or folder names are handled on
+  both sides. Drive names that cannot exist locally (containing `/`, or `.`/`..`) and local names that
+  are not valid UTF-8 are reported and skipped. When Drive holds several items with the same name in one
+  folder, the first is used.
 - **Paths**: `PATH` is relative to the current directory and may be a file or a directory inside the sync root.
   Depth applies from that path.
 

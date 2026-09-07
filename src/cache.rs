@@ -3,19 +3,23 @@
 // DriveSync (dsync) — https://github.com/scaleninja/drivesync
 
 //! SQLite-backed index of the remote tree (`.gd/cache.db`), kept current via the Drive Changes API.
+//!
+//! The connection sits behind a mutex so worker threads can record each completed upload or folder
+//! creation immediately, which keeps a cancelled push resumable even if the Changes feed lags.
 use crate::drive::Drive;
 use crate::sync::{join_rel, Entry};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 const TOKEN_KEY: &str = "start_page_token";
 const UPDATED_KEY: &str = "updated_at";
 const DEPTH_KEY: &str = "depth";
 
 pub struct Cache {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Cache {
@@ -32,24 +36,27 @@ impl Cache {
              CREATE INDEX IF NOT EXISTS files_id ON files(id);
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+        meta(&self.conn(), key)
     }
 
+    #[cfg(test)]
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
-        Ok(())
+        set_meta(&self.conn(), key, value)
     }
 
     pub fn count(&self) -> Result<usize> {
         Ok(self
-            .conn
+            .conn()
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))?
             as usize)
     }
@@ -58,55 +65,32 @@ impl Cache {
         self.meta(UPDATED_KEY)
     }
 
+    /// Record one remote entry; safe to call from worker threads.
     pub fn upsert(&self, path: &str, e: &Entry) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO files(path, id, mtime_ms, md5, is_dir, native_doc) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(path) DO UPDATE SET id = excluded.id, mtime_ms = excluded.mtime_ms, md5 = excluded.md5,
-                 is_dir = excluded.is_dir, native_doc = excluded.native_doc",
-            params![path, e.id.as_deref().unwrap_or(""), e.mtime_ms, e.md5, e.is_dir, e.native_doc],
-        )?;
-        Ok(())
+        upsert(&self.conn(), path, e)
     }
 
-    pub fn upsert_all(&self, entries: &BTreeMap<String, Entry>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for (p, e) in entries {
-            self.upsert(p, e)?;
-        }
-        Ok(tx.commit()?)
-    }
-
+    #[cfg(test)]
     /// Remove `path` and everything below it.
     pub fn remove(&self, path: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-            params![path, format!("{}/%", like_escape(path))],
-        )?;
-        Ok(())
+        remove(&self.conn(), path)
     }
 
+    #[cfg(test)]
     /// Move `old` (and its subtree) to `new`.
     pub fn rename(&self, old: &str, new: &str) -> Result<()> {
-        self.remove(new)?;
-        self.conn.execute(
-            "UPDATE files SET path = ?2 || substr(path, length(?1) + 1) WHERE path = ?1 OR path LIKE ?3 ESCAPE '\\'",
-            params![old, new, format!("{}/%", like_escape(old))],
-        )?;
-        Ok(())
+        rename(&self.conn(), old, new)
     }
 
+    #[cfg(test)]
     pub fn path_of_id(&self, id: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT path FROM files WHERE id = ?1 LIMIT 1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?)
+        path_of_id(&self.conn(), id)
     }
 
     /// Entries at or below `prefix` ("" = whole tree), keyed by relative path.
     pub fn load(&self, prefix: &str) -> Result<BTreeMap<String, Entry>> {
-        let mut stmt = self.conn.prepare("SELECT path, id, mtime_ms, md5, is_dir, native_doc FROM files WHERE ?1 = '' OR path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT path, id, mtime_ms, md5, is_dir, native_doc FROM files WHERE ?1 = '' OR path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
         let rows = stmt.query_map(params![prefix, format!("{}/%", like_escape(prefix))], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -122,23 +106,80 @@ impl Cache {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    fn replace_all(&self, entries: &BTreeMap<String, Entry>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        self.conn.execute("DELETE FROM files", [])?;
+    fn replace_all(
+        &self,
+        entries: &BTreeMap<String, Entry>,
+        token: &str,
+        depth: i32,
+    ) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM files", [])?;
         for (p, e) in entries {
-            self.upsert(p, e)?;
+            upsert(&tx, p, e)?;
         }
+        touch(&tx, token, depth)?;
         Ok(tx.commit()?)
     }
+}
 
-    fn touch(&self, token: &str, depth: i32) -> Result<()> {
-        self.set_meta(TOKEN_KEY, token)?;
-        self.set_meta(DEPTH_KEY, &depth.to_string())?;
-        self.set_meta(
-            UPDATED_KEY,
-            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        )
-    }
+// Connection-level operations, shared by the public methods and by `apply_changes`, which holds the
+// lock for its whole transaction.
+
+fn meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?)
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
+    Ok(())
+}
+
+fn upsert(conn: &Connection, path: &str, e: &Entry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO files(path, id, mtime_ms, md5, is_dir, native_doc) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(path) DO UPDATE SET id = excluded.id, mtime_ms = excluded.mtime_ms, md5 = excluded.md5,
+             is_dir = excluded.is_dir, native_doc = excluded.native_doc",
+        params![path, e.id.as_deref().unwrap_or(""), e.mtime_ms, e.md5, e.is_dir, e.native_doc],
+    )?;
+    Ok(())
+}
+
+fn remove(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+        params![path, format!("{}/%", like_escape(path))],
+    )?;
+    Ok(())
+}
+
+fn rename(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    remove(conn, new)?;
+    conn.execute(
+        "UPDATE files SET path = ?2 || substr(path, length(?1) + 1) WHERE path = ?1 OR path LIKE ?3 ESCAPE '\\'",
+        params![old, new, format!("{}/%", like_escape(old))],
+    )?;
+    Ok(())
+}
+
+fn path_of_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT path FROM files WHERE id = ?1 LIMIT 1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+fn touch(conn: &Connection, token: &str, depth: i32) -> Result<()> {
+    set_meta(conn, TOKEN_KEY, token)?;
+    set_meta(conn, DEPTH_KEY, &depth.to_string())?;
+    set_meta(
+        conn,
+        UPDATED_KEY,
+        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 fn like_escape(s: &str) -> String {
@@ -156,12 +197,10 @@ pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bo
             Err(e) => crate::progress::eprintln(&format!("warning: incremental cache refresh failed ({e:#}); listing the remote tree in full")),
         }
     }
-    // Take the token before walking so nothing that happens during the walk is missed.
+    // Take the token before listing so nothing that happens during the listing is missed.
     let token = drive.start_page_token()?;
-    let mut all = BTreeMap::new();
-    drive.walk(root_id, "", depth, &mut all)?;
-    cache.replace_all(&all)?;
-    cache.touch(&token, depth)
+    let all = drive.list_tree(root_id, depth)?;
+    cache.replace_all(&all, &token, depth)
 }
 
 fn apply_changes(
@@ -172,38 +211,47 @@ fn apply_changes(
     token: &str,
 ) -> Result<()> {
     let (changes, new_token) = drive.changes(token)?;
-    let tx = cache.conn.unchecked_transaction()?;
+    let conn = cache.conn();
+    let tx = conn.unchecked_transaction()?;
     for ch in changes {
-        let old_path = cache.path_of_id(&ch.file_id)?;
-        let drop_old = |cache: &Cache| -> Result<()> {
-            old_path.as_deref().map_or(Ok(()), |p| cache.remove(p))
+        let old_path = path_of_id(&tx, &ch.file_id)?;
+        let drop_old = |conn: &Connection| -> Result<()> {
+            old_path.as_deref().map_or(Ok(()), |p| remove(conn, p))
         };
         let Some(f) = ch.file.filter(|f| !ch.removed && !f.trashed) else {
-            drop_old(cache)?;
+            drop_old(&tx)?;
             continue;
         };
         // Locate the parent inside our tree; anything else has moved out of (or was never in) scope.
         let parent_path = match f.parents.first() {
             Some(p) if p == root_id => Some(String::new()),
-            Some(p) => cache.path_of_id(p)?,
+            Some(p) => path_of_id(&tx, p)?,
             None => None,
         };
         let Some(parent_path) = parent_path else {
-            drop_old(cache)?;
+            drop_old(&tx)?;
             continue;
         };
+        if !crate::sync::valid_name(&f.file.name) {
+            crate::progress::eprintln(&format!(
+                "! skip     remote name {:?} cannot be a local path",
+                f.file.name
+            ));
+            drop_old(&tx)?;
+            continue;
+        }
         let new_path = join_rel(&parent_path, &f.file.name);
         let level = new_path.matches('/').count() as i32 + 1;
         if depth >= 0 && level > depth {
-            drop_old(cache)?;
+            drop_old(&tx)?;
             continue;
         }
         if let Some(old) = old_path.as_deref().filter(|old| *old != new_path) {
-            cache.rename(old, &new_path)?;
+            rename(&tx, old, &new_path)?;
         }
         let entry = f.file.to_entry();
         let new_folder = entry.is_dir && old_path.is_none();
-        cache.upsert(&new_path, &entry)?;
+        upsert(&tx, &new_path, &entry)?;
         if new_folder {
             let mut sub = BTreeMap::new();
             drive.walk(
@@ -213,11 +261,11 @@ fn apply_changes(
                 &mut sub,
             )?;
             for (p, e) in &sub {
-                cache.upsert(p, e)?;
+                upsert(&tx, p, e)?;
             }
         }
     }
-    cache.touch(&new_token, depth)?;
+    touch(&tx, &new_token, depth)?;
     Ok(tx.commit()?)
 }
 
@@ -267,5 +315,69 @@ mod tests {
         c.set_meta("k", "w").unwrap();
         assert_eq!(c.meta("k").unwrap().as_deref(), Some("w"));
         assert_eq!(c.meta("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn special_characters_in_paths() {
+        let c = Cache::open(Path::new(":memory:")).unwrap();
+        let names = [
+            "My Documents",
+            "My Documents/it's 100%_done.md",
+            "My Documents/sub folder",
+            "My Documents/sub folder/deep file.txt",
+            "My_Documents",
+            "My Documentsx/other.txt",
+            "back\\slash/f.txt",
+            "ünïcödé 日本語/café.txt",
+        ];
+        for (i, n) in names.iter().enumerate() {
+            c.upsert(n, &e(&i.to_string(), !n.contains('.'))).unwrap();
+        }
+        // Prefix load must not treat spaces, %, _ or \ as wildcards or separators.
+        assert_eq!(
+            c.load("My Documents")
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "My Documents",
+                "My Documents/it's 100%_done.md",
+                "My Documents/sub folder",
+                "My Documents/sub folder/deep file.txt"
+            ]
+        );
+        assert_eq!(c.load("My_Documents").unwrap().len(), 1);
+        assert_eq!(c.load("back\\slash").unwrap().len(), 1);
+        assert_eq!(c.load("ünïcödé 日本語").unwrap().len(), 1);
+        c.rename("My Documents/sub folder", "Renamed Folder (v2)")
+            .unwrap();
+        assert_eq!(
+            c.path_of_id("3").unwrap().as_deref(),
+            Some("Renamed Folder (v2)/deep file.txt")
+        );
+        c.remove("My Documents").unwrap();
+        assert_eq!(c.load("").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn concurrent_upserts_from_workers() {
+        let dir = std::env::temp_dir().join(format!("dsync_cache_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Cache::open(&dir.join("cache.db")).unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let c = &c;
+                s.spawn(move || {
+                    for i in 0..50 {
+                        c.upsert(&format!("t{t}/f{i}"), &e(&format!("{t}-{i}"), false))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(c.count().unwrap(), 400);
+        drop(c);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

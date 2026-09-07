@@ -94,6 +94,12 @@ enum Cmd {
         #[arg(long)]
         refresh: bool,
     },
+    /// Refresh the local index of remote files (incrementally, or fully with --refresh)
+    UpdateCache {
+        /// Ignore the cache and re-list the whole remote tree
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Print the CLI version
     Version,
 }
@@ -137,6 +143,7 @@ fn run() -> Result<()> {
             refresh,
         } => pull(&path, force, no_prompt, threads.into(), refresh),
         Cmd::Status => status(),
+        Cmd::UpdateCache { refresh } => update_cache(refresh),
         Cmd::Diff { path, refresh } => diff(&path, refresh),
         Cmd::Version => {
             println!(
@@ -195,8 +202,9 @@ fn init(
         http.clone(),
         auth::Auth::new(http, config.clone(), creds, creds_path),
     );
+    let root_id = drive.file_id("root")?; // real id, so Changes-feed parent ids can be matched
     config.remote_folder_id = drive
-        .resolve_folder("root", &config.remote_folder, true)?
+        .resolve_folder(&root_id, &config.remote_folder, true)?
         .context("resolving remote folder")?;
     save_json(&root.join(GD_DIR).join("config.json"), &config)?;
     if !root.join(config::IGNORE_FILE).exists() {
@@ -214,14 +222,20 @@ fn init(
     Ok(())
 }
 
-fn open(ws: &Workspace) -> Result<Drive> {
+fn open(ws: &mut Workspace) -> Result<Drive> {
     let creds_path = ws.gd("credentials.json");
     let creds: Credentials = load_json(&creds_path).context("no credentials; run `dsync init`")?;
     let http = http();
-    Ok(Drive::new(
+    let drive = Drive::new(
         http.clone(),
         auth::Auth::new(http, ws.config.clone(), creds, creds_path),
-    ))
+    );
+    if ws.config.remote_folder_id == "root" {
+        // Older workspaces stored the alias; the Changes feed reports real parent ids.
+        ws.config.remote_folder_id = drive.file_id("root")?;
+        save_json(&ws.gd("config.json"), &ws.config)?;
+    }
+    Ok(drive)
 }
 
 /// Resolve a user-supplied relative path to (absolute local path, workspace-relative path).
@@ -281,8 +295,8 @@ fn snapshot(
 }
 
 fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool) -> Result<()> {
-    let ws = Workspace::find()?;
-    let drive = open(&ws)?;
+    let mut ws = Workspace::find()?;
+    let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
@@ -290,12 +304,12 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
     if !abs.exists() {
         bail!("{} does not exist", abs.display());
     }
-    let (local, mut remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
+    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
     let (actions, skips) = sync::plan_push(&local, &remote, force);
     if !sync::confirm(&actions, &skips, no_prompt)? {
         return Ok(());
     }
-    // Folder that will hold the pushed subtree (created on demand); the cache learns about it on the next refresh.
+    // Folder that will hold the pushed subtree; created on demand and recorded in the cache.
     let base_rel = if abs.is_file() {
         rel.rsplit_once('/')
             .map(|(p, _)| p)
@@ -306,27 +320,34 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
     };
     let base_id = match remote.get(&base_rel).and_then(|e| e.id.clone()) {
         Some(id) => id,
-        None => drive
-            .resolve_folder(&ws.config.remote_folder_id, &base_rel, true)?
-            .context("creating remote folder")?,
+        None if base_rel.is_empty() => ws.config.remote_folder_id.clone(),
+        None => {
+            let id = drive
+                .resolve_folder(&ws.config.remote_folder_id, &base_rel, true)?
+                .context("creating remote folder")?;
+            cache.upsert(
+                &base_rel,
+                &sync::Entry {
+                    mtime_ms: 0,
+                    md5: None,
+                    is_dir: true,
+                    id: Some(id.clone()),
+                    native_doc: false,
+                },
+            )?;
+            id
+        }
     };
     let total = actions.len();
     let failures = sync::exec_push(
-        &drive,
-        &ws.root,
-        &base_rel,
-        &base_id,
-        actions,
-        &mut remote,
-        threads,
+        &drive, &cache, &ws.root, &base_rel, &base_id, actions, threads,
     )?;
-    cache.upsert_all(&remote)?;
     finish("push", total, failures)
 }
 
 fn pull(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool) -> Result<()> {
-    let ws = Workspace::find()?;
-    let drive = open(&ws)?;
+    let mut ws = Workspace::find()?;
+    let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
@@ -356,8 +377,8 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
 }
 
 fn diff(path: &str, refresh: bool) -> Result<()> {
-    let ws = Workspace::find()?;
-    let drive = open(&ws)?;
+    let mut ws = Workspace::find()?;
+    let drive = open(&mut ws)?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
     let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
@@ -391,6 +412,32 @@ fn diff(path: &str, refresh: bool) -> Result<()> {
     Ok(())
 }
 
+fn update_cache(refresh: bool) -> Result<()> {
+    let mut ws = Workspace::find()?;
+    let drive = open(&mut ws)?;
+    let cache = Cache::open(&ws.gd("cache.db"))?;
+    let before = cache.count()?;
+    let spinner = progress::Spinner::start(if refresh {
+        "Listing the remote tree..."
+    } else {
+        "Refreshing remote index..."
+    });
+    cache::refresh(
+        &drive,
+        &cache,
+        &ws.config.remote_folder_id,
+        ws.config.depth,
+        refresh,
+    )?;
+    spinner.finish();
+    println!(
+        "cache updated: {} entries (was {before}), {}",
+        cache.count()?,
+        cache.updated_at()?.unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn status() -> Result<()> {
     let ws = Workspace::find()?;
     let c = &ws.config;
@@ -416,7 +463,7 @@ fn status() -> Result<()> {
             cache_path.display()
         ),
         Ok((_, None)) => println!(
-            "Cache           : {} (empty; run push, pull or diff)",
+            "Cache           : {} (empty; run update-cache, push, pull or diff)",
             cache_path.display()
         ),
         Err(e) => println!(
