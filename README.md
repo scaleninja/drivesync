@@ -17,7 +17,7 @@ dsync version
 
 ## Install
 
-Prebuilt binaries for Linux, macOS and Windows (x86_64 and arm64) are attached to each
+Prebuilt binaries for Linux and macOS (x86_64 and arm64) are attached to each
 [GitHub release](https://github.com/scaleninja/drivesync/releases).
 
 ```bash
@@ -32,8 +32,6 @@ esac
 curl -fL -o /tmp/dsync "https://github.com/scaleninja/drivesync/releases/latest/download/dsync-$asset" \
   && chmod 755 /tmp/dsync && sudo mv /tmp/dsync /usr/local/bin/dsync
 ```
-
-On Windows download `dsync-windows-x86_64.exe` or `dsync-windows-arm64.exe` and put it on your `PATH`.
 
 Or build from source (needs a Rust toolchain):
 
@@ -109,8 +107,12 @@ dsync pull -y -j 16 # no prompt, 16 parallel streams
   to Drive's `modifiedTime`, so `dsync diff` is clean after a sync.
 - **Confirmation**: push and pull first print the planned changes (mkdir / upload / update / download and
   any skips) and ask `Proceed with the changes? [Y/n]`. Pass `--no-prompt` (`-y`) for scripts.
-- **Parallelism**: folders are created first, then file transfers run on `--threads` (`-j`) workers,
-  default 8, max 64. One failed file does not stop the others; the exit code is non-zero if any failed.
+- **Parallelism**: folders are created first, then file transfers (push and pull alike) run on
+  `--threads` (`-j`) workers, default 8, max 64. A spinner shows progress while scanning and transferring.
+  One failed file does not stop the others; the exit code is non-zero if any failed.
+- **Transfers**: files up to 5 MB go in a single multipart request; larger files stream through a
+  resumable upload session, and downloads stream to a temp file that is renamed into place. Rate-limit
+  (403/429), server (5xx) and network errors are retried with exponential backoff.
 - **Safety**: push skips files where remote is newer, pull skips files where local is newer, unless `--force`.
   Nothing is ever deleted on either side. Google-native docs (Docs/Sheets/...) are listed but not downloaded.
 - **Cache**: `.gd/cache.db` is a SQLite index of the remote tree (path, id, mtime, md5). It is opened in
@@ -135,25 +137,23 @@ make check            # fmt + clippy
 
 ### Cross-compiling
 
-Six targets are supported. Linux and Windows are cross-compiled with
+Four targets are supported. Linux is cross-compiled with
 [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (Zig acts as the C cross-compiler for the
-bundled SQLite); Linux binaries are static musl. macOS targets are built natively with cargo, so run those
-on a Mac.
+bundled SQLite) and produces fully static musl binaries. macOS targets are built natively with cargo, so run
+those on a Mac. Windows is not supported.
 
 ```
 make setup            # one-time: rustup targets + cargo-zigbuild (install zig first, e.g. brew install zig)
 make all-targets      # everything into dist/
-make linux-x86_64     # or: linux-arm64, windows-x86_64, windows-arm64, macos-x86_64, macos-arm64
+make linux-x86_64     # or: linux-arm64, macos-x86_64, macos-arm64
 ```
 
-| Target           | Rust triple                  | Built with     |
-|------------------|------------------------------|----------------|
-| `linux-x86_64`   | `x86_64-unknown-linux-musl`  | cargo-zigbuild |
-| `linux-arm64`    | `aarch64-unknown-linux-musl` | cargo-zigbuild |
-| `windows-x86_64` | `x86_64-pc-windows-gnullvm`  | cargo-zigbuild |
-| `windows-arm64`  | `aarch64-pc-windows-gnullvm` | cargo-zigbuild |
-| `macos-x86_64`   | `x86_64-apple-darwin`        | cargo          |
-| `macos-arm64`    | `aarch64-apple-darwin`       | cargo          |
+| Target         | Rust triple                  | Built with     |
+|----------------|------------------------------|----------------|
+| `linux-x86_64` | `x86_64-unknown-linux-musl`  | cargo-zigbuild |
+| `linux-arm64`  | `aarch64-unknown-linux-musl` | cargo-zigbuild |
+| `macos-x86_64` | `x86_64-apple-darwin`        | cargo          |
+| `macos-arm64`  | `aarch64-apple-darwin`       | cargo          |
 
-The GitHub Actions workflow in `.github/workflows/release.yml` runs the tests and builds all six targets on
+The GitHub Actions workflow in `.github/workflows/release.yml` runs the tests and builds all four targets on
 every `v*` tag, attaching the binaries to a GitHub release.

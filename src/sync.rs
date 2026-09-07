@@ -1,11 +1,17 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ScaleNinja
+// DriveSync (dsync) — https://github.com/scaleninja/drivesync
+
 //! Local walking, remote/local comparison, and the push/pull engines.
 use crate::config::{GD_DIR, IGNORE_FILE};
 use crate::drive::Drive;
+use crate::progress::{self, Spinner};
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ignore::gitignore::Gitignore;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 /// Clock skew tolerated before two mtimes are considered different.
@@ -93,7 +99,7 @@ fn is_ignored(root: &Path, ignore: &Gitignore, path: &Path, is_dir: bool) -> boo
     path.strip_prefix(root)
         .ok()
         .and_then(|r| r.components().next())
-        .map_or(false, |c| c.as_os_str() == GD_DIR)
+        .is_some_and(|c| c.as_os_str() == GD_DIR)
         || ignore.matched_path_or_any_parents(path, is_dir).is_ignore()
 }
 
@@ -113,10 +119,9 @@ pub fn local_walk(
     if depth >= 0 && base.is_dir() {
         walker = walker.max_depth(depth as usize);
     }
-    for entry in walker
-        .into_iter()
-        .filter_entry(|e| !is_ignored(root, ignore, e.path(), e.file_type().is_dir()))
-    {
+    for entry in walker.into_iter().filter_entry(|e| {
+        !e.file_type().is_symlink() && !is_ignored(root, ignore, e.path(), e.file_type().is_dir())
+    }) {
         let entry = entry?;
         let meta = entry.metadata()?;
         let mtime_ms = meta
@@ -125,7 +130,7 @@ pub fn local_walk(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let md5 = if with_md5 && meta.is_file() {
-            Some(format!("{:x}", md5::compute(std::fs::read(entry.path())?)))
+            Some(file_md5(entry.path())?)
         } else {
             None
         };
@@ -141,6 +146,21 @@ pub fn local_walk(
         );
     }
     Ok(out)
+}
+
+/// MD5 of a file, streamed in 64 KiB chunks so large files are not read into memory.
+pub fn file_md5(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut ctx = md5::Context::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(format!("{:x}", ctx.compute()));
+        }
+        ctx.consume(&buf[..n]);
+    }
 }
 
 /// Compare two snapshots; returns only paths that differ.
@@ -377,7 +397,7 @@ pub fn exec_push(
         match a {
             Action::Mkdir { path } => {
                 let f = drive.create_folder(&parent_id, path.rsplit('/').next().unwrap())?;
-                println!("+ mkdir    {path}/");
+                progress::println(&format!("+ mkdir    {path}/"));
                 folder_ids.insert(path.clone(), f.id.clone());
                 remote.insert(path, f.to_entry());
             }
@@ -389,35 +409,39 @@ pub fn exec_push(
             Action::Download { .. } => unreachable!(),
         }
     }
+    let total = uploads.len();
+    let done = AtomicUsize::new(0);
+    let spinner = Spinner::start(&format!("Uploading 0/{total} ({threads} streams)"));
     let results = parallel(
         uploads,
         threads,
         |(path, parent_id, existing_id, mtime_ms)| {
-            let result = std::fs::read(root.join(&path))
-                .map_err(anyhow::Error::from)
-                .and_then(|data| {
-                    drive.upload(
-                        &parent_id,
-                        path.rsplit('/').next().unwrap(),
-                        existing_id.as_deref(),
-                        data,
-                        &fmt_ms(mtime_ms),
-                    )
-                });
+            let result = drive.upload(
+                &parent_id,
+                path.rsplit('/').next().unwrap(),
+                existing_id.as_deref(),
+                &root.join(&path),
+                &fmt_ms(mtime_ms),
+            );
             match &result {
-                Ok(_) => println!(
+                Ok(_) => progress::println(&format!(
                     "^ {:<8} {path}",
                     if existing_id.is_some() {
                         "updated"
                     } else {
                         "uploaded"
                     }
-                ),
-                Err(e) => eprintln!("x failed   {path}: {e:#}"),
+                )),
+                Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
             }
+            spinner.set(format!(
+                "Uploading {}/{total} ({threads} streams)",
+                done.fetch_add(1, Ordering::SeqCst) + 1
+            ));
             (path, result)
         },
     );
+    spinner.finish();
     let mut failures = 0;
     for (path, r) in results {
         match r {
@@ -442,19 +466,22 @@ pub fn exec_pull(
         match a {
             Action::Mkdir { path } => {
                 std::fs::create_dir_all(root.join(&path))?;
-                println!("+ mkdir    {path}/");
+                progress::println(&format!("+ mkdir    {path}/"));
             }
             Action::Download { path, id, mtime_ms } => downloads.push((path, id, mtime_ms)),
             Action::Upload { .. } => unreachable!(),
         }
     }
+    let total = downloads.len();
+    let done = AtomicUsize::new(0);
+    let spinner = Spinner::start(&format!("Downloading 0/{total} ({threads} streams)"));
     let results = parallel(downloads, threads, |(path, id, mtime_ms)| {
         let dest = root.join(&path);
-        let result = drive.download(&id).and_then(|data| {
+        let result = (|| -> Result<()> {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&dest, data)?;
+            drive.download_to(&id, &dest)?;
             filetime::set_file_mtime(
                 &dest,
                 filetime::FileTime::from_unix_time(
@@ -463,13 +490,18 @@ pub fn exec_pull(
                 ),
             )?;
             Ok(())
-        });
+        })();
         match &result {
-            Ok(()) => println!("v downloaded {path}"),
-            Err(e) => eprintln!("x failed   {path}: {e:#}"),
+            Ok(()) => progress::println(&format!("v downloaded {path}")),
+            Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
         }
+        spinner.set(format!(
+            "Downloading {}/{total} ({threads} streams)",
+            done.fetch_add(1, Ordering::SeqCst) + 1
+        ));
         result.is_err()
     });
+    spinner.finish();
     Ok(results.into_iter().filter(|failed| *failed).count())
 }
 

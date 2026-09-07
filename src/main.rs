@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ScaleNinja
+// DriveSync (dsync) — https://github.com/scaleninja/drivesync
+
 mod auth;
 mod cache;
 mod config;
 mod drive;
+mod progress;
 mod sync;
 
 use anyhow::{bail, Context, Result};
@@ -252,8 +257,17 @@ fn snapshot(
     rel: &str,
     refresh: bool,
 ) -> Result<(Snapshot, Snapshot)> {
+    let spinner = progress::Spinner::start("Scanning local files...");
     let ignore = sync::load_ignore(&ws.root);
     let local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore, true)?;
+    spinner.set(
+        if refresh {
+            "Listing the remote tree..."
+        } else {
+            "Refreshing remote index..."
+        }
+        .to_string(),
+    );
     cache::refresh(
         drive,
         cache,
@@ -261,7 +275,9 @@ fn snapshot(
         ws.config.depth,
         refresh,
     )?;
-    Ok((local, cache.load(rel)?))
+    let remote = cache.load(rel)?;
+    spinner.finish();
+    Ok((local, remote))
 }
 
 fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool) -> Result<()> {

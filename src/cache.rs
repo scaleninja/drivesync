@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ScaleNinja
+// DriveSync (dsync) — https://github.com/scaleninja/drivesync
+
 //! SQLite-backed index of the remote tree (`.gd/cache.db`), kept current via the Drive Changes API.
 use crate::drive::Drive;
 use crate::sync::{join_rel, Entry};
@@ -149,7 +153,7 @@ pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bo
     if let (false, true, Some(token)) = (full, same_depth, cache.meta(TOKEN_KEY)?) {
         match apply_changes(drive, cache, root_id, depth, &token) {
             Ok(()) => return Ok(()),
-            Err(e) => eprintln!("warning: incremental cache refresh failed ({e:#}); listing the remote tree in full"),
+            Err(e) => crate::progress::eprintln(&format!("warning: incremental cache refresh failed ({e:#}); listing the remote tree in full")),
         }
     }
     // Take the token before walking so nothing that happens during the walk is missed.

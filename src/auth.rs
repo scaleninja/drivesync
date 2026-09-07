@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ScaleNinja
+// DriveSync (dsync) — https://github.com/scaleninja/drivesync
+
 //! OAuth2 installed-app flow (loopback redirect) and access-token refresh.
 use crate::config::{save_json, Config, Credentials};
 use anyhow::{bail, Context, Result};

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ScaleNinja
+// DriveSync (dsync) — https://github.com/scaleninja/drivesync
+
 //! On-disk state: `.gd/config.json` and `.gd/credentials.json` (the cache lives in `.gd/cache.db`).
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
