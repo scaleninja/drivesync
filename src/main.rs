@@ -294,13 +294,10 @@ fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
     Ok(lock)
 }
 
-/// Whether the workspace filesystem folds case (macOS and Windows defaults). Probed once per run.
+/// Whether the workspace filesystem folds case (macOS and Windows defaults). Probed by looking
+/// up the always-present `config.json` under another spelling; nothing is written.
 fn case_insensitive_fs(ws: &Workspace) -> bool {
-    let probe = ws.gd("case.probe");
-    if !probe.exists() && std::fs::write(&probe, b"").is_err() {
-        return false;
-    }
-    ws.gd("CASE.PROBE").exists() && probe.exists()
+    ws.gd("config.json").is_file() && ws.gd("CONFIG.JSON").is_file()
 }
 
 type Snapshot = BTreeMap<String, sync::Entry>;

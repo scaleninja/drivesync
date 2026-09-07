@@ -385,16 +385,23 @@ pub fn fill_hashes(
     Ok(())
 }
 
-/// Paths that collide with another path when case is ignored, including everything below a
-/// colliding folder. On a case-insensitive filesystem these map to one local file and must not
-/// be transferred.
+/// The form under which a case- and normalization-insensitive filesystem (macOS, Windows) treats
+/// two names as the same file.
+fn fold(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.nfc().collect::<String>().to_lowercase()
+}
+
+/// Paths that collide with another path once case and Unicode normalization are ignored,
+/// including everything below a colliding folder. On such a filesystem these map to one local
+/// file and must not be transferred.
 pub fn case_collisions(
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
 ) -> BTreeSet<String> {
     let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     for p in local.keys().chain(remote.keys()) {
-        groups.entry(p.to_lowercase()).or_default().insert(p);
+        groups.entry(fold(p)).or_default().insert(p);
     }
     let roots: BTreeSet<&str> = groups
         .values()
@@ -1661,6 +1668,15 @@ mod tests {
             }]
         );
         assert!(case_collisions(&local, &BTreeMap::new()).is_empty());
+        // NFC and NFD spellings of the same name are one file on macOS and Windows.
+        let nfc: BTreeMap<_, _> = [("caf\u{e9}.txt".to_string(), sized(1, 1))]
+            .into_iter()
+            .collect();
+        let nfd: BTreeMap<_, _> = [("cafe\u{301}.txt".to_string(), sized(1, 1))]
+            .into_iter()
+            .collect();
+        assert_eq!(case_collisions(&nfc, &nfd).len(), 2);
+        assert!(case_collisions(&nfc, &nfc).is_empty());
     }
 
     #[test]

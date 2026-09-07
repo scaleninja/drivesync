@@ -118,7 +118,8 @@ Proceed with the changes? [Y/n]:
 ## What it will never do
 
 - **Delete anything**, on either side. A file removed locally stays on Drive, and vice versa.
-- **Overwrite a conflict** without `--force`, or a case collision at all. While conflicts exist the
+- **Overwrite a conflict** without `--force`, or a name collision (case or Unicode normalization,
+  on filesystems that fold them) at all. While conflicts exist the
   prompt defaults to *no*, `--no-prompt` refuses to run, and end-of-input is never taken as *yes*.
 - **Write stale data.** Every destination is re-checked right before it is written: a local file must
   still have the size and mtime the plan saw; a Drive file must still have the MD5, mtime, name and
@@ -138,7 +139,9 @@ backoff; a push interrupted with Ctrl-C can simply be re-run.
 
 - Two machines syncing the same Drive folder are not coordinated; there is no three-way merge.
 - A full listing holds every My Drive entry in memory while the tree is assembled.
-- Unicode normalization differences (NFC vs NFD) are not detected as name collisions.
+- Another local process writing to the sync folder at the same moment as `dsync` is outside the
+  supported threat model: destinations are checked immediately before each write, but not atomically
+  with it.
 - The hash cache trusts an unchanged size and mtime, like git; use `--verify` after restoring files
   from a backup or when a tool rewrites files with their mtimes preserved.
 
