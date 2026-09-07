@@ -126,6 +126,25 @@ impl Cache {
         Ok(())
     }
 
+    /// Forget cached hashes under `prefix` for files that no longer exist locally.
+    pub fn prune_local_hashes(&self, prefix: &str, keep: &BTreeMap<String, Entry>) -> Result<()> {
+        let conn = self.conn();
+        let stale: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT path FROM local_hashes WHERE ?1 = '' OR {SUBTREE}"
+            ))?;
+            let rows = stmt.query_map(params![prefix], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok())
+                .filter(|p| !keep.contains_key(p))
+                .collect()
+        };
+        let tx = conn.unchecked_transaction()?;
+        for p in &stale {
+            tx.execute("DELETE FROM local_hashes WHERE path = ?1", [p])?;
+        }
+        Ok(tx.commit()?)
+    }
+
     /// Folders whose contents still need listing (recorded durably so a crash cannot lose them).
     pub fn pending_walks(&self) -> Result<Vec<(String, String, i32)>> {
         let conn = self.conn();
@@ -550,6 +569,33 @@ mod tests {
         );
         assert_eq!(c.id_at("m/n").unwrap().as_deref(), Some("2"));
         assert_eq!(c.id_at("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn local_hash_pruning_is_scoped() {
+        let c = Cache::open(Path::new(":memory:")).unwrap();
+        for p in ["a/keep.txt", "a/gone.txt", "b/other.txt", "A/case.txt"] {
+            c.set_local_hash(p, 1, 1, "h").unwrap();
+        }
+        let keep: BTreeMap<String, Entry> = [("a/keep.txt".to_string(), Entry::default())]
+            .into_iter()
+            .collect();
+        c.prune_local_hashes("a", &keep).unwrap();
+        assert_eq!(
+            c.local_hash("a/keep.txt", 1, 1).unwrap().as_deref(),
+            Some("h")
+        );
+        assert_eq!(c.local_hash("a/gone.txt", 1, 1).unwrap(), None);
+        assert_eq!(
+            c.local_hash("b/other.txt", 1, 1).unwrap().as_deref(),
+            Some("h"),
+            "outside the prefix is untouched"
+        );
+        assert_eq!(
+            c.local_hash("A/case.txt", 1, 1).unwrap().as_deref(),
+            Some("h"),
+            "prefix is case-sensitive"
+        );
     }
 
     #[test]

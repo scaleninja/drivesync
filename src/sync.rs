@@ -118,7 +118,8 @@ pub fn display(path: &str) -> String {
 
 /// Paths dsync owns or must never write: anything under `.gd/` and download temp files.
 pub fn is_reserved(rel: &str) -> bool {
-    rel.split('/').any(|c| c == GD_DIR) || rel.ends_with(PART_SUFFIX)
+    rel.split('/')
+        .any(|c| c == GD_DIR || c.ends_with(PART_SUFFIX))
 }
 
 /// Normalize `path` (relative to cwd) to an absolute path without touching the filesystem.
@@ -186,6 +187,14 @@ fn is_ignored(root: &Path, ignore: &Gitignore, path: &Path, is_dir: bool) -> boo
     ignore.matched_path_or_any_parents(path, is_dir).is_ignore()
 }
 
+/// Whether an explicitly selected path is excluded by `.driveignore` (or reserved).
+pub fn is_excluded(root: &Path, ignore: &Gitignore, abs: &Path) -> bool {
+    let is_dir = std::fs::symlink_metadata(abs)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    is_ignored(root, ignore, abs, is_dir)
+}
+
 /// Drop remote entries the local side would never scan, so nothing can be pulled over an ignored
 /// or reserved local path, and nothing ignored is ever compared.
 pub fn filter_remote(root: &Path, ignore: &Gitignore, remote: &mut BTreeMap<String, Entry>) {
@@ -219,6 +228,9 @@ pub fn local_walk(
         );
     }
     let base_rel = rel_path(root, base)?;
+    if !base_rel.is_empty() {
+        guard_parents(root, &base_rel)?; // never read through a symlinked ancestor either
+    }
     let base_level = if base_rel.is_empty() {
         0
     } else {
@@ -903,7 +915,7 @@ pub fn finalize_download(
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(dest)
-                .map(|m| m.permissions().mode() & 0o7777)
+                .map(|m| m.permissions().mode() & 0o777) // never carry setuid/setgid/sticky bits
                 .unwrap_or(0o644);
             std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode))?;
         }
@@ -1763,6 +1775,21 @@ mod tests {
             "existing mode kept"
         );
         assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7000,
+            0,
+            "no special bits"
+        );
+        // A setuid destination never passes setuid on to downloaded content.
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let m2 = std::fs::metadata(&dest).unwrap();
+        let expected2 = Some((m2.len(), mtime_ms_of(&m2)));
+        std::fs::write(&tmp, "again").unwrap();
+        finalize_download(&tmp, &dest, expected2, 1_700_000_000_500).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
             mtime_ms_of(&std::fs::metadata(&dest).unwrap()),
             1_700_000_000_500
         );
@@ -1979,6 +2006,16 @@ mod tests {
                 local_walk(&dir, &dir.join("alias"), -1, &ignore).is_err(),
                 "a symlinked selection is refused"
             );
+            assert!(
+                local_walk(&dir, &dir.join("alias/one.txt"), -1, &ignore)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink"),
+                "so is a selection below a symlinked ancestor"
+            );
+            assert!(is_excluded(&dir, &ignore, &dir.join("node_modules")));
+            assert!(is_excluded(&dir, &ignore, &dir.join("a/b/two.log")));
+            assert!(!is_excluded(&dir, &ignore, &dir.join("a")));
             assert!(!local_walk(&dir, &dir, -1, &ignore)
                 .unwrap()
                 .contains_key("alias"));
@@ -2059,6 +2096,10 @@ mod tests {
         assert!(is_reserved(".gd/config.json"));
         assert!(is_reserved("x/.gd/y"));
         assert!(is_reserved("x/.y.dsync-part"));
+        assert!(
+            is_reserved("x.dsync-part/child.txt"),
+            "reserved suffix applies to every component"
+        );
         assert!(!is_reserved(".gdx/file"));
         assert!(!is_reserved("normal/.hidden"));
     }

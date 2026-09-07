@@ -113,13 +113,19 @@ enum Cmd {
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
-    }
+    // Every command returns before the process exits, so locks and the cache close cleanly.
+    let code = match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
-fn run() -> Result<()> {
+/// Runs a command and returns the process exit code (`diff` uses 1 to mean "differences found").
+fn run() -> Result<i32> {
     match Cli::parse().cmd {
         Cmd::Init {
             dir,
@@ -135,11 +141,12 @@ fn run() -> Result<()> {
             client_id,
             client_secret,
             credentials,
-        ),
-        Cmd::Push(o) => push(&o),
-        Cmd::Pull(o) => pull(&o),
-        Cmd::Status => status(),
-        Cmd::UpdateCache { refresh } => update_cache(refresh),
+        )
+        .map(|()| 0),
+        Cmd::Push(o) => push(&o).map(|()| 0),
+        Cmd::Pull(o) => pull(&o).map(|()| 0),
+        Cmd::Status => status().map(|()| 0),
+        Cmd::UpdateCache { refresh } => update_cache(refresh).map(|()| 0),
         Cmd::Diff {
             path,
             refresh,
@@ -152,7 +159,7 @@ fn run() -> Result<()> {
                 "dsync {} (https://scaleninja.com/drivesync/)",
                 env!("CARGO_PKG_VERSION")
             );
-            Ok(())
+            Ok(0)
         }
     }
 }
@@ -195,8 +202,10 @@ fn init(
         (None, None, None) => bundled.context("missing --client-id/--client-secret (or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
         _ => bail!("--client-id and --client-secret must be given together"),
     };
+    if depth != -1 && depth < 1 {
+        bail!("--depth must be -1 (unlimited) or a positive number of levels");
+    }
     let root = sync::absolutize(dir)?;
-    std::fs::create_dir_all(root.join(GD_DIR))?;
     let mut config = Config {
         client_id,
         client_secret,
@@ -208,6 +217,7 @@ fn init(
     // Nothing on disk changes until Google has accepted the authorization.
     let http = http();
     let creds = auth::Auth::login(&http, &config)?;
+    std::fs::create_dir_all(root.join(GD_DIR))?;
     let ws = Workspace {
         root: root.clone(),
         config: config.clone(),
@@ -269,7 +279,8 @@ fn target(ws: &Workspace, path: &str) -> Result<(std::path::PathBuf, String)> {
     Ok((abs, rel))
 }
 
-/// Take an exclusive workspace lock so two instances cannot push/pull the same tree at once.
+/// The workspace lock: push, pull and init hold it exclusively; diff and update-cache hold it
+/// shared, so readers never overlap a writer but may overlap each other.
 fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -279,7 +290,6 @@ fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
     let mut lock = fd_lock::RwLock::new(file);
     if lock.try_write().is_err() {
         eprintln!("waiting for another dsync instance to finish...");
-        drop(lock.write()?);
     }
     Ok(lock)
 }
@@ -313,7 +323,12 @@ fn snapshot(
 ) -> Result<Snap> {
     let spinner = progress::Spinner::start("Scanning local files...");
     let ignore = sync::load_ignore(&ws.root);
+    if !rel.is_empty() && sync::is_excluded(&ws.root, &ignore, abs) {
+        spinner.finish();
+        bail!("{rel} is excluded by {}", config::IGNORE_FILE);
+    }
     let mut local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore)?;
+    cache.prune_local_hashes(rel, &local)?;
     spinner.set(
         if o.refresh {
             "Listing the remote tree..."
@@ -446,9 +461,11 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
     Ok(())
 }
 
-fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<()> {
+fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<i32> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
+    let lock = lock(&ws)?;
+    let _guard = lock.read()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
     let opts = SyncOpts {
@@ -470,7 +487,7 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
     changes.sort();
     if changes.is_empty() {
         println!("local and remote are in sync");
-        return Ok(());
+        return Ok(0);
     }
     let mut counts = BTreeMap::new();
     for (p, change) in &changes {
@@ -497,12 +514,14 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
         .map(|(label, n)| format!("{n} {label}"))
         .collect();
     println!("{} file(s) differ: {}", changes.len(), summary.join(", "));
-    std::process::exit(1)
+    Ok(1)
 }
 
 fn update_cache(refresh: bool) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
+    let lock = lock(&ws)?;
+    let _guard = lock.read()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let before = cache.count()?;
     let spinner = progress::Spinner::start(if refresh {
