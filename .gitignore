@@ -1,0 +1,4 @@
+/target
+/dist
+.gd/
+.DS_Store

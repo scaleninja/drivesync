@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl,  name: linux-x86_64,   zig: true }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-musl, name: linux-arm64,    zig: true }
+          - { os: ubuntu-latest,  target: x86_64-pc-windows-gnullvm,  name: windows-x86_64, zig: true,  ext: .exe }
+          - { os: ubuntu-latest,  target: aarch64-pc-windows-gnullvm, name: windows-arm64,  zig: true,  ext: .exe }
+          - { os: macos-latest,   target: x86_64-apple-darwin,        name: macos-x86_64 }
+          - { os: macos-latest,   target: aarch64-apple-darwin,       name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+      - if: matrix.zig
+        run: cargo install cargo-zigbuild --locked
+      - name: Build
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then cargo zigbuild --release --target ${{ matrix.target }}
+          else cargo build --release --target ${{ matrix.target }}; fi
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/dsync${{ matrix.ext }} dist/dsync-${{ github.ref_name }}-${{ matrix.name }}${{ matrix.ext }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsync-${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
