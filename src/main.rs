@@ -15,10 +15,9 @@ use clap::{Parser, Subcommand};
 use config::{load_json, save_json, Config, Credentials, Workspace, GD_DIR};
 use drive::Drive;
 use std::path::Path;
-use sync::Change;
 
 #[derive(Parser)]
-#[command(name = "dsync", version, about = "DriveSync: push, pull and diff a local directory against Google Drive", long_about = None, after_help = "Project: https://github.com/scaleninja/drivesync")]
+#[command(name = "dsync", version, about = "DriveSync: push, pull and diff a local directory against Google Drive", long_about = None, after_help = "Home: https://scaleninja.com/drivesync/  Source: https://github.com/scaleninja/drivesync")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -64,6 +63,9 @@ enum Cmd {
         /// Ignore the cache and re-list the whole remote tree
         #[arg(long)]
         refresh: bool,
+        /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
+        #[arg(long)]
+        fast: bool,
     },
     /// Download remote changes from Google Drive
     Pull {
@@ -82,10 +84,13 @@ enum Cmd {
         /// Ignore the cache and re-list the whole remote tree
         #[arg(long)]
         refresh: bool,
+        /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
+        #[arg(long)]
+        fast: bool,
     },
     /// Show the workspace configuration and cache state
     Status,
-    /// List files whose local and remote modification times differ
+    /// Show differences between local and remote files in a unified-diff style listing
     Diff {
         /// Relative path to compare (default: current directory)
         #[arg(default_value = ".")]
@@ -93,6 +98,12 @@ enum Cmd {
         /// Ignore the cache and re-list the whole remote tree
         #[arg(long)]
         refresh: bool,
+        /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
+        #[arg(long)]
+        fast: bool,
+        /// Number of threads used for hashing
+        #[arg(long, short = 'j', default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+        threads: u16,
     },
     /// Refresh the local index of remote files (incrementally, or fully with --refresh)
     UpdateCache {
@@ -134,20 +145,27 @@ fn run() -> Result<()> {
             no_prompt,
             threads,
             refresh,
-        } => push(&path, force, no_prompt, threads.into(), refresh),
+            fast,
+        } => push(&path, force, no_prompt, threads.into(), refresh, fast),
         Cmd::Pull {
             path,
             force,
             no_prompt,
             threads,
             refresh,
-        } => pull(&path, force, no_prompt, threads.into(), refresh),
+            fast,
+        } => pull(&path, force, no_prompt, threads.into(), refresh, fast),
         Cmd::Status => status(),
         Cmd::UpdateCache { refresh } => update_cache(refresh),
-        Cmd::Diff { path, refresh } => diff(&path, refresh),
+        Cmd::Diff {
+            path,
+            refresh,
+            fast,
+            threads,
+        } => diff(&path, refresh, fast, threads.into()),
         Cmd::Version => {
             println!(
-                "dsync {} (https://github.com/scaleninja/drivesync)",
+                "dsync {} (https://scaleninja.com/drivesync/)",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -156,8 +174,12 @@ fn run() -> Result<()> {
 }
 
 fn http() -> reqwest::blocking::Client {
+    // No overall timeout: a multi-gigabyte upload or download may legitimately take hours.
+    // Dead connections are still detected via the connect timeout and TCP keepalive.
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .timeout(None)
         .build()
         .expect("http client")
 }
@@ -178,12 +200,19 @@ fn init(
             (get("client_id")?, get("client_secret")?)
         }
         None => (
-            client_id.context("missing --client-id (or GOOGLE_CLIENT_ID, or --credentials client_secret.json)")?,
-            client_secret.context("missing --client-secret (or GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
+            client_id
+                .or_else(|| option_env!("DSYNC_CLIENT_ID").map(String::from))
+                .context("missing --client-id (or GOOGLE_CLIENT_ID, or --credentials client_secret.json)")?,
+            client_secret
+                .or_else(|| option_env!("DSYNC_CLIENT_SECRET").map(String::from))
+                .context("missing --client-secret (or GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
         ),
     };
     let root = sync::absolutize(dir)?;
     std::fs::create_dir_all(root.join(GD_DIR))?;
+    for stale in ["cache.db", "cache.db-wal", "cache.db-shm"] {
+        let _ = std::fs::remove_file(root.join(GD_DIR).join(stale)); // re-init may point elsewhere
+    }
     let remote_folder = remote_folder.trim_matches('/').to_string();
     let mut config = Config {
         client_id,
@@ -263,6 +292,7 @@ fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
 type Snapshot = std::collections::BTreeMap<String, sync::Entry>;
 
 /// Snapshot both sides of the subtree at `rel`: the local walk and the (refreshed) cache of the remote tree.
+#[allow(clippy::too_many_arguments)]
 fn snapshot(
     ws: &Workspace,
     drive: &Drive,
@@ -270,10 +300,12 @@ fn snapshot(
     abs: &Path,
     rel: &str,
     refresh: bool,
+    fast: bool,
+    threads: usize,
 ) -> Result<(Snapshot, Snapshot)> {
     let spinner = progress::Spinner::start("Scanning local files...");
     let ignore = sync::load_ignore(&ws.root);
-    let local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore, true)?;
+    let mut local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore)?;
     spinner.set(
         if refresh {
             "Listing the remote tree..."
@@ -291,10 +323,18 @@ fn snapshot(
     )?;
     let remote = cache.load(rel)?;
     spinner.finish();
+    sync::fill_hashes(&ws.root, cache, &mut local, &remote, fast, threads)?;
     Ok((local, remote))
 }
 
-fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool) -> Result<()> {
+fn push(
+    path: &str,
+    force: bool,
+    no_prompt: bool,
+    threads: usize,
+    refresh: bool,
+    fast: bool,
+) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
@@ -304,11 +344,12 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
     if !abs.exists() {
         bail!("{} does not exist", abs.display());
     }
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
-    let (actions, skips) = sync::plan_push(&local, &remote, force);
-    if !sync::confirm(&actions, &skips, no_prompt)? {
+    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
+    let plan = sync::plan_push(&local, &remote, force);
+    if !sync::confirm(&plan, &local, &remote, no_prompt)? {
         return Ok(());
     }
+    let actions = plan.actions;
     // Folder that will hold the pushed subtree; created on demand and recorded in the cache.
     let base_rel = if abs.is_file() {
         rel.rsplit_once('/')
@@ -318,7 +359,11 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
     } else {
         rel.clone()
     };
-    let base_id = match remote.get(&base_rel).and_then(|e| e.id.clone()) {
+    let known = remote
+        .get(&base_rel)
+        .or(cache.load(&base_rel)?.get(&base_rel))
+        .and_then(|e| e.id.clone());
+    let base_id = match known {
         Some(id) => id,
         None if base_rel.is_empty() => ws.config.remote_folder_id.clone(),
         None => {
@@ -328,11 +373,9 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
             cache.upsert(
                 &base_rel,
                 &sync::Entry {
-                    mtime_ms: 0,
-                    md5: None,
                     is_dir: true,
                     id: Some(id.clone()),
-                    native_doc: false,
+                    ..Default::default()
                 },
             )?;
             id
@@ -345,26 +388,34 @@ fn push(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool)
     finish("push", total, failures)
 }
 
-fn pull(path: &str, force: bool, no_prompt: bool, threads: usize, refresh: bool) -> Result<()> {
+fn pull(
+    path: &str,
+    force: bool,
+    no_prompt: bool,
+    threads: usize,
+    refresh: bool,
+    fast: bool,
+) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
+    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
     if remote.is_empty() && !rel.is_empty() {
         bail!(
             "remote path '{rel}' does not exist under My Drive/{}",
             ws.config.remote_folder
         );
     }
-    let (actions, skips) = sync::plan_pull(&local, &remote, force);
-    if !sync::confirm(&actions, &skips, no_prompt)? {
+    let plan = sync::plan_pull(&local, &remote, force);
+    if !sync::confirm(&plan, &local, &remote, no_prompt)? {
         return Ok(());
     }
+    let actions = plan.actions;
     let total = actions.len();
-    let failures = sync::exec_pull(&drive, &ws.root, actions, threads)?;
+    let failures = sync::exec_pull(&drive, &cache, &ws.root, actions, threads)?;
     finish("pull", total, failures)
 }
 
@@ -376,39 +427,30 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
     Ok(())
 }
 
-fn diff(path: &str, refresh: bool) -> Result<()> {
+fn diff(path: &str, refresh: bool, fast: bool, threads: usize) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh)?;
+    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
     let changes = sync::diff(&local, &remote);
     if changes.is_empty() {
         println!("local and remote are in sync");
         return Ok(());
     }
-    println!(
-        "{:<2} {:<40} {:<24} {:<24}",
-        "", "path", "local modified", "remote modified"
-    );
+    let mut counts = std::collections::BTreeMap::new();
     for (p, change) in &changes {
-        let l = local
-            .get(p)
-            .map(|e| sync::fmt_ms(e.mtime_ms))
-            .unwrap_or_else(|| "-".into());
-        let r = remote
-            .get(p)
-            .map(|e| sync::fmt_ms(e.mtime_ms))
-            .unwrap_or_else(|| "-".into());
-        let mark = match change {
-            Change::LocalOnly => "+",
-            Change::RemoteOnly => "-",
-            Change::LocalNewer => ">",
-            Change::RemoteNewer => "<",
-        };
-        println!("{mark:<2} {p:<40} {l:<24} {r:<24}");
+        println!(
+            "{}",
+            sync::diff_line(p, *change, local.get(p), remote.get(p))
+        );
+        *counts.entry(change.label()).or_insert(0usize) += 1;
     }
-    println!("\n+ local only   - remote only   > local newer   < remote newer");
+    let summary: Vec<String> = counts
+        .iter()
+        .map(|(label, n)| format!("{n} {label}"))
+        .collect();
+    println!("{} file(s) differ: {}", changes.len(), summary.join(", "));
     Ok(())
 }
 

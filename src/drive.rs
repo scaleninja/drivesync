@@ -17,7 +17,7 @@ use std::time::Duration;
 const API: &str = "https://www.googleapis.com/drive/v3/files";
 const CHANGES: &str = "https://www.googleapis.com/drive/v3/changes";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3/files";
-const FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum";
+const FIELDS: &str = "id,name,mimeType,modifiedTime,md5Checksum,size";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Google rejects multipart uploads above 5 MB; larger files use a resumable session.
 const MULTIPART_LIMIT: u64 = 5 * 1024 * 1024;
@@ -31,6 +31,8 @@ pub struct File {
     pub mime_type: String,
     pub modified_time: Option<String>,
     pub md5_checksum: Option<String>,
+    /// Bytes, as a decimal string (absent for folders and Google-native docs).
+    pub size: Option<String>,
 }
 
 impl File {
@@ -48,6 +50,7 @@ impl File {
                 .as_deref()
                 .and_then(crate::sync::parse_rfc3339_ms)
                 .unwrap_or(0),
+            size: self.size.as_deref().and_then(|s| s.parse().ok()),
             md5: self.md5_checksum.clone(),
             is_dir: self.is_folder(),
             id: Some(self.id.clone()),
@@ -146,7 +149,7 @@ impl Drive {
             }
             bail!("Drive API error {status}: {body}");
         }
-        unreachable!()
+        bail!("request failed after {attempts} attempt(s)")
     }
 
     fn query(&self, q: String) -> Result<Vec<File>> {
@@ -301,20 +304,32 @@ impl Drive {
         Err(last_err.unwrap()).context("resumable upload failed")
     }
 
-    /// Stream a file's content to `dest` (written via a temp file, then renamed into place).
-    pub fn download_to(&self, id: &str, dest: &Path) -> Result<()> {
+    /// Stream a file's content to `dest` via a temp file that is renamed into place only after the
+    /// bytes have been verified against `expected_md5` (when Drive provides one).
+    pub fn download_to(&self, id: &str, dest: &Path, expected_md5: Option<&str>) -> Result<()> {
         let url = format!("{API}/{id}");
         let mut resp = self.send(&move |c| Ok(c.get(&url).query(&[("alt", "media")])))?;
         let tmp = dest.with_file_name(format!(
-            ".{}.dsync-part",
+            ".{}{}",
             dest.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("download")
+                .unwrap_or("download"),
+            crate::sync::PART_SUFFIX
         ));
-        let result = std::fs::File::create(&tmp)
-            .map_err(anyhow::Error::from)
-            .and_then(|mut f| Ok(resp.copy_to(&mut f)?))
-            .and_then(|_| Ok(std::fs::rename(&tmp, dest)?));
+        let result = (|| -> Result<()> {
+            let mut writer = HashWriter {
+                inner: std::fs::File::create(&tmp)?,
+                ctx: md5::Context::new(),
+            };
+            resp.copy_to(&mut writer)?;
+            let actual = format!("{:x}", writer.ctx.compute());
+            if let Some(expected) = expected_md5 {
+                if actual != expected {
+                    bail!("checksum mismatch after download (expected {expected}, got {actual})");
+                }
+            }
+            Ok(std::fs::rename(&tmp, dest)?)
+        })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -453,6 +468,23 @@ impl Drive {
     }
 }
 
+/// Writes through to `inner` while computing an MD5 of everything written.
+struct HashWriter<W: std::io::Write> {
+    inner: W,
+    ctx: md5::Context,
+}
+
+impl<W: std::io::Write> std::io::Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.ctx.consume(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Build the relative-path map from a parent-id -> children index, breadth-first from `root_id`,
 /// honouring `depth`, skipping unmappable names and keeping the first of any duplicate names.
 fn assemble_tree(
@@ -517,7 +549,24 @@ mod tests {
             },
             modified_time: Some("2026-09-08T00:00:00.000Z".into()),
             md5_checksum: (!folder).then(|| "abc".into()),
+            size: (!folder).then(|| "42".into()),
         }
+    }
+
+    #[test]
+    fn hash_writer_hashes_what_it_writes() {
+        use std::io::Write;
+        let mut w = HashWriter {
+            inner: Vec::new(),
+            ctx: md5::Context::new(),
+        };
+        w.write_all(b"hel").unwrap();
+        w.write_all(b"lo").unwrap();
+        assert_eq!(w.inner, b"hello");
+        assert_eq!(
+            format!("{:x}", w.ctx.compute()),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
     }
 
     #[test]

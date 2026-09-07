@@ -77,17 +77,31 @@ impl Auth {
             .stderr(std::process::Stdio::null())
             .spawn();
 
-        let (mut stream, _) = listener.accept()?;
-        let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf)?;
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let query = request
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|target| target.split_once('?'))
-            .map(|(_, q)| q)
-            .unwrap_or("");
+        // Browsers may open speculative connections that never send a request; skip those.
+        let (mut stream, query) = loop {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+            let mut buf = [0u8; 8192];
+            let n = match stream.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let query = request
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|target| target.split_once('?'))
+                .map(|(_, q)| q.to_string());
+            match query {
+                Some(q) if q.contains("state=") => break (stream, q),
+                _ => {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        };
+        let query = query.as_str();
         let param = |key: &str| {
             query
                 .split('&')
