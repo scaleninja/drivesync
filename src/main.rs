@@ -14,13 +14,45 @@ use cache::Cache;
 use clap::{Parser, Subcommand};
 use config::{load_json, save_json, Config, Credentials, Workspace, GD_DIR};
 use drive::Drive;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "dsync", version, about = "DriveSync: push, pull and diff a local directory against Google Drive", long_about = None, after_help = "Home: https://scaleninja.com/drivesync/  Source: https://github.com/scaleninja/drivesync")]
+#[command(
+    name = "dsync",
+    version,
+    about = "DriveSync: push, pull and diff a local directory against Google Drive",
+    long_about = None,
+    after_help = "Home: https://scaleninja.com/drivesync/  Source: https://github.com/scaleninja/drivesync"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(clap::Args, Clone)]
+struct SyncOpts {
+    /// Relative path to operate on (default: current directory)
+    #[arg(default_value = ".")]
+    path: String,
+    /// Overwrite even when the destination copy is newer or content differs at equal mtime
+    #[arg(long)]
+    force: bool,
+    /// Apply changes without asking for confirmation (refused if there are conflicts)
+    #[arg(long, short = 'y')]
+    no_prompt: bool,
+    /// Number of parallel transfer streams
+    #[arg(long, short = 'j', default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    threads: u16,
+    /// Ignore the cache and re-list the whole remote tree
+    #[arg(long)]
+    refresh: bool,
+    /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
+    #[arg(long, conflicts_with = "verify")]
+    fast: bool,
+    /// Re-read every file that needs hashing instead of trusting the local hash cache
+    #[arg(long)]
+    verify: bool,
 }
 
 #[derive(Subcommand)]
@@ -33,7 +65,7 @@ enum Cmd {
         /// Remote folder path under "My Drive" (created if missing; default: My Drive root)
         #[arg(long, default_value = "")]
         remote_folder: String,
-        /// Traversal depth (-1 = unlimited)
+        /// Traversal depth from the sync root (-1 = unlimited)
         #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
         depth: i32,
         /// OAuth client id (or env GOOGLE_CLIENT_ID)
@@ -47,50 +79,12 @@ enum Cmd {
         credentials: Option<String>,
     },
     /// Upload local changes to Google Drive
-    Push {
-        /// Relative path to push (default: current directory)
-        #[arg(default_value = ".")]
-        path: String,
-        /// Overwrite even when the remote copy is newer
-        #[arg(long)]
-        force: bool,
-        /// Apply changes without asking for confirmation
-        #[arg(long, short = 'y')]
-        no_prompt: bool,
-        /// Number of parallel transfer streams
-        #[arg(long, short = 'j', default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
-        threads: u16,
-        /// Ignore the cache and re-list the whole remote tree
-        #[arg(long)]
-        refresh: bool,
-        /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
-        #[arg(long)]
-        fast: bool,
-    },
+    Push(SyncOpts),
     /// Download remote changes from Google Drive
-    Pull {
-        /// Relative path to pull (default: current directory)
-        #[arg(default_value = ".")]
-        path: String,
-        /// Overwrite even when the local copy is newer
-        #[arg(long)]
-        force: bool,
-        /// Apply changes without asking for confirmation
-        #[arg(long, short = 'y')]
-        no_prompt: bool,
-        /// Number of parallel transfer streams
-        #[arg(long, short = 'j', default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
-        threads: u16,
-        /// Ignore the cache and re-list the whole remote tree
-        #[arg(long)]
-        refresh: bool,
-        /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
-        #[arg(long)]
-        fast: bool,
-    },
+    Pull(SyncOpts),
     /// Show the workspace configuration and cache state
     Status,
-    /// Show differences between local and remote files in a unified-diff style listing
+    /// List files that differ between local and remote (exit status 1 if any do)
     Diff {
         /// Relative path to compare (default: current directory)
         #[arg(default_value = ".")]
@@ -99,8 +93,11 @@ enum Cmd {
         #[arg(long)]
         refresh: bool,
         /// Trust equal size and mtime instead of verifying MD5 (rsync-style quick check)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "verify")]
         fast: bool,
+        /// Re-read every file that needs hashing instead of trusting the local hash cache
+        #[arg(long)]
+        verify: bool,
         /// Number of threads used for hashing
         #[arg(long, short = 'j', default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
         threads: u16,
@@ -139,30 +136,17 @@ fn run() -> Result<()> {
             client_secret,
             credentials,
         ),
-        Cmd::Push {
-            path,
-            force,
-            no_prompt,
-            threads,
-            refresh,
-            fast,
-        } => push(&path, force, no_prompt, threads.into(), refresh, fast),
-        Cmd::Pull {
-            path,
-            force,
-            no_prompt,
-            threads,
-            refresh,
-            fast,
-        } => pull(&path, force, no_prompt, threads.into(), refresh, fast),
+        Cmd::Push(o) => push(&o),
+        Cmd::Pull(o) => pull(&o),
         Cmd::Status => status(),
         Cmd::UpdateCache { refresh } => update_cache(refresh),
         Cmd::Diff {
             path,
             refresh,
             fast,
+            verify,
             threads,
-        } => diff(&path, refresh, fast, threads.into()),
+        } => diff(&path, refresh, fast, verify, threads.into()),
         Cmd::Version => {
             println!(
                 "dsync {} (https://scaleninja.com/drivesync/)",
@@ -192,50 +176,58 @@ fn init(
     client_secret: Option<String>,
     credentials: Option<String>,
 ) -> Result<()> {
-    let (client_id, client_secret) = match credentials {
-        Some(file) => {
+    // A client bundled at build time is used only as a whole, never mixed with a partial override.
+    let bundled = match (
+        option_env!("DSYNC_CLIENT_ID"),
+        option_env!("DSYNC_CLIENT_SECRET"),
+    ) {
+        (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
+        _ => None,
+    };
+    let (client_id, client_secret) = match (credentials, client_id, client_secret) {
+        (Some(file), _, _) => {
             let v: serde_json::Value = load_json(Path::new(&file))?;
             let app = v.get("installed").or_else(|| v.get("web")).context("client_secret.json has no 'installed' or 'web' section")?;
             let get = |k: &str| app.get(k).and_then(|x| x.as_str()).map(String::from).with_context(|| format!("client_secret.json missing {k}"));
             (get("client_id")?, get("client_secret")?)
         }
-        None => (
-            client_id
-                .or_else(|| option_env!("DSYNC_CLIENT_ID").map(String::from))
-                .context("missing --client-id (or GOOGLE_CLIENT_ID, or --credentials client_secret.json)")?,
-            client_secret
-                .or_else(|| option_env!("DSYNC_CLIENT_SECRET").map(String::from))
-                .context("missing --client-secret (or GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
-        ),
+        (None, Some(id), Some(secret)) => (id, secret),
+        (None, None, None) => bundled.context("missing --client-id/--client-secret (or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
+        _ => bail!("--client-id and --client-secret must be given together"),
     };
     let root = sync::absolutize(dir)?;
     std::fs::create_dir_all(root.join(GD_DIR))?;
-    for stale in ["cache.db", "cache.db-wal", "cache.db-shm"] {
-        let _ = std::fs::remove_file(root.join(GD_DIR).join(stale)); // re-init may point elsewhere
-    }
-    let remote_folder = remote_folder.trim_matches('/').to_string();
     let mut config = Config {
         client_id,
         client_secret,
-        remote_folder,
-        remote_folder_id: "root".into(),
+        remote_folder: remote_folder.trim_matches('/').to_string(),
+        remote_folder_id: String::new(),
         depth,
     };
 
+    // Nothing on disk changes until Google has accepted the authorization.
     let http = http();
     let creds = auth::Auth::login(&http, &config)?;
-    let creds_path = root.join(GD_DIR).join("credentials.json");
-    save_json(&creds_path, &creds)?;
-
+    let ws = Workspace {
+        root: root.clone(),
+        config: config.clone(),
+    };
+    let mut lock = lock(&ws)?;
+    let _guard = lock.write()?;
+    for stale in ["cache.db", "cache.db-wal", "cache.db-shm"] {
+        let _ = std::fs::remove_file(ws.gd(stale)); // a re-init may point at another folder
+    }
+    let creds_path = ws.gd("credentials.json");
     let drive = Drive::new(
         http.clone(),
-        auth::Auth::new(http, config.clone(), creds, creds_path),
+        auth::Auth::new(http, config.clone(), creds.clone(), creds_path.clone()),
     );
     let root_id = drive.file_id("root")?; // real id, so Changes-feed parent ids can be matched
     config.remote_folder_id = drive
         .resolve_folder(&root_id, &config.remote_folder, true)?
         .context("resolving remote folder")?;
-    save_json(&root.join(GD_DIR).join("config.json"), &config)?;
+    save_json(&creds_path, &creds)?;
+    save_json(&ws.gd("config.json"), &config)?;
     if !root.join(config::IGNORE_FILE).exists() {
         std::fs::write(
             root.join(config::IGNORE_FILE),
@@ -271,6 +263,9 @@ fn open(ws: &mut Workspace) -> Result<Drive> {
 fn target(ws: &Workspace, path: &str) -> Result<(std::path::PathBuf, String)> {
     let abs = sync::absolutize(path)?;
     let rel = sync::rel_path(&ws.root, &abs)?;
+    if sync::is_reserved(&rel) {
+        bail!("{rel} is reserved for dsync's own state");
+    }
     Ok((abs, rel))
 }
 
@@ -289,25 +284,38 @@ fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
     Ok(lock)
 }
 
-type Snapshot = std::collections::BTreeMap<String, sync::Entry>;
+/// Whether the workspace filesystem folds case (macOS and Windows defaults). Probed once per run.
+fn case_insensitive_fs(ws: &Workspace) -> bool {
+    let probe = ws.gd("case.probe");
+    if !probe.exists() && std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    ws.gd("CASE.PROBE").exists() && probe.exists()
+}
 
-/// Snapshot both sides of the subtree at `rel`: the local walk and the (refreshed) cache of the remote tree.
-#[allow(clippy::too_many_arguments)]
+type Snapshot = BTreeMap<String, sync::Entry>;
+
+struct Snap {
+    local: Snapshot,
+    remote: Snapshot,
+    collisions: BTreeSet<String>,
+}
+
+/// Snapshot both sides of the subtree at `rel`: the local walk and the refreshed remote index,
+/// both filtered by the same ignore and reserved-path rules, with local hashes where needed.
 fn snapshot(
     ws: &Workspace,
     drive: &Drive,
     cache: &Cache,
     abs: &Path,
     rel: &str,
-    refresh: bool,
-    fast: bool,
-    threads: usize,
-) -> Result<(Snapshot, Snapshot)> {
+    o: &SyncOpts,
+) -> Result<Snap> {
     let spinner = progress::Spinner::start("Scanning local files...");
     let ignore = sync::load_ignore(&ws.root);
     let mut local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore)?;
     spinner.set(
-        if refresh {
+        if o.refresh {
             "Listing the remote tree..."
         } else {
             "Refreshing remote index..."
@@ -319,47 +327,55 @@ fn snapshot(
         cache,
         &ws.config.remote_folder_id,
         ws.config.depth,
-        refresh,
+        o.refresh,
     )?;
-    let remote = cache.load(rel)?;
+    let mut remote = cache.load(rel)?;
+    sync::filter_remote(&ws.root, &ignore, &mut remote);
     spinner.finish();
-    sync::fill_hashes(&ws.root, cache, &mut local, &remote, fast, threads)?;
-    Ok((local, remote))
+    sync::fill_hashes(
+        &ws.root,
+        cache,
+        &mut local,
+        &remote,
+        o.fast,
+        o.verify,
+        o.threads.into(),
+    )?;
+    let collisions = if case_insensitive_fs(ws) {
+        sync::case_collisions(&local, &remote)
+    } else {
+        BTreeSet::new()
+    };
+    Ok(Snap {
+        local,
+        remote,
+        collisions,
+    })
 }
 
-fn push(
-    path: &str,
-    force: bool,
-    no_prompt: bool,
-    threads: usize,
-    refresh: bool,
-    fast: bool,
-) -> Result<()> {
+fn push(o: &SyncOpts) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
-    let (abs, rel) = target(&ws, path)?;
+    let (abs, rel) = target(&ws, &o.path)?;
     if !abs.exists() {
         bail!("{} does not exist", abs.display());
     }
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
-    let plan = sync::plan_push(&local, &remote, force);
-    if !sync::confirm(&plan, &local, &remote, no_prompt)? {
-        return Ok(());
+    let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
+    let plan = sync::plan_push(&snap.local, &snap.remote, o.force, &snap.collisions);
+    if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
+        return finish("push", 0, plan.errors.len());
     }
-    let actions = plan.actions;
     // Folder that will hold the pushed subtree; created on demand and recorded in the cache.
     let base_rel = if abs.is_file() {
-        rel.rsplit_once('/')
-            .map(|(p, _)| p)
-            .unwrap_or("")
-            .to_string()
+        sync::parent_of(&rel).to_string()
     } else {
         rel.clone()
     };
-    let known = remote
+    let known = snap
+        .remote
         .get(&base_rel)
         .or(cache.load(&base_rel)?.get(&base_rel))
         .and_then(|e| e.id.clone());
@@ -381,77 +397,107 @@ fn push(
             id
         }
     };
-    let total = actions.len();
+    let total = plan.actions.len();
     let failures = sync::exec_push(
-        &drive, &cache, &ws.root, &base_rel, &base_id, actions, threads,
+        &drive,
+        &cache,
+        &ws.root,
+        &base_rel,
+        &base_id,
+        plan.actions,
+        o.threads.into(),
     )?;
-    finish("push", total, failures)
+    finish("push", total, failures + plan.errors.len())
 }
 
-fn pull(
-    path: &str,
-    force: bool,
-    no_prompt: bool,
-    threads: usize,
-    refresh: bool,
-    fast: bool,
-) -> Result<()> {
+fn pull(o: &SyncOpts) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
-    let (abs, rel) = target(&ws, path)?;
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
-    if remote.is_empty() && !rel.is_empty() {
+    let (abs, rel) = target(&ws, &o.path)?;
+    let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
+    if snap.remote.is_empty() && !rel.is_empty() {
         bail!(
             "remote path '{rel}' does not exist under My Drive/{}",
             ws.config.remote_folder
         );
     }
-    let plan = sync::plan_pull(&local, &remote, force);
-    if !sync::confirm(&plan, &local, &remote, no_prompt)? {
-        return Ok(());
+    let plan = sync::plan_pull(&snap.local, &snap.remote, o.force, &snap.collisions);
+    if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
+        return finish("pull", 0, plan.errors.len());
     }
-    let actions = plan.actions;
-    let total = actions.len();
-    let failures = sync::exec_pull(&drive, &cache, &ws.root, actions, threads)?;
-    finish("pull", total, failures)
+    let total = plan.actions.len();
+    let failures = sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?;
+    finish("pull", total, failures + plan.errors.len())
 }
 
 fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
     if failures > 0 {
-        bail!("{verb} finished with {failures} of {total} change(s) failed");
+        bail!(
+            "{verb} finished with {failures} failure(s) out of {} item(s)",
+            total + failures
+        );
     }
-    println!("{verb} complete: {total} change(s)");
+    if total > 0 {
+        println!("{verb} complete: {total} change(s)");
+    }
     Ok(())
 }
 
-fn diff(path: &str, refresh: bool, fast: bool, threads: usize) -> Result<()> {
+fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
     let cache = Cache::open(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
-    let (local, remote) = snapshot(&ws, &drive, &cache, &abs, &rel, refresh, fast, threads)?;
-    let changes = sync::diff(&local, &remote);
+    let opts = SyncOpts {
+        path: path.into(),
+        force: false,
+        no_prompt: false,
+        threads: threads as u16,
+        refresh,
+        fast,
+        verify,
+    };
+    let snap = snapshot(&ws, &drive, &cache, &abs, &rel, &opts)?;
+    let mut changes = sync::diff(&snap.local, &snap.remote);
+    for p in &snap.collisions {
+        if !changes.iter().any(|(c, _)| c == p) {
+            changes.push((p.clone(), sync::Change::TypeMismatch));
+        }
+    }
+    changes.sort();
     if changes.is_empty() {
         println!("local and remote are in sync");
         return Ok(());
     }
-    let mut counts = std::collections::BTreeMap::new();
+    let mut counts = BTreeMap::new();
     for (p, change) in &changes {
-        println!(
-            "{}",
-            sync::diff_line(p, *change, local.get(p), remote.get(p))
-        );
-        *counts.entry(change.label()).or_insert(0usize) += 1;
+        let label = if snap.collisions.contains(p) {
+            "case collision"
+        } else {
+            change.label()
+        };
+        if snap.collisions.contains(p) {
+            println!(
+                "{}",
+                sync::line("C", p, "name differs only by case from another entry")
+            );
+        } else {
+            println!(
+                "{}",
+                sync::diff_line(p, *change, snap.local.get(p), snap.remote.get(p))
+            );
+        }
+        *counts.entry(label).or_insert(0usize) += 1;
     }
     let summary: Vec<String> = counts
         .iter()
         .map(|(label, n)| format!("{n} {label}"))
         .collect();
     println!("{} file(s) differ: {}", changes.len(), summary.join(", "));
-    Ok(())
+    std::process::exit(1)
 }
 
 fn update_cache(refresh: bool) -> Result<()> {
@@ -525,6 +571,14 @@ fn status() -> Result<()> {
         }
         Err(_) => println!("Ignore file     : {} (absent)", ignore.display()),
     }
+    println!(
+        "Filesystem      : case-{}",
+        if case_insensitive_fs(&ws) {
+            "insensitive (name collisions are reported as conflicts)"
+        } else {
+            "sensitive"
+        }
+    );
     match load_json::<Credentials>(&ws.gd("credentials.json")) {
         Ok(creds) => {
             let left = creds.expires_at - auth::now();

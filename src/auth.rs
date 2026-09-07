@@ -2,7 +2,7 @@
 // Copyright (c) 2026 ScaleNinja
 // DriveSync (dsync) — https://github.com/scaleninja/drivesync
 
-//! OAuth2 installed-app flow (loopback redirect) and access-token refresh.
+//! OAuth2 installed-app flow (loopback redirect, PKCE) and access-token refresh.
 use crate::config::{save_json, Config, Credentials};
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
@@ -26,6 +26,36 @@ struct TokenResponse {
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| anyhow::anyhow!("secure random source unavailable: {e}"))?;
+    Ok(buf)
+}
+
+/// Unpadded base64url (RFC 4648 §5), as required for PKCE values.
+fn base64url(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..=chunk.len() {
+            out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// PKCE S256 challenge for a verifier.
+fn pkce_challenge(verifier: &str) -> String {
+    base64url(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref())
 }
 
 pub struct Auth {
@@ -53,15 +83,14 @@ impl Auth {
     pub fn login(http: &Client, config: &Config) -> Result<Credentials> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
-        let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|e| anyhow::anyhow!("generating OAuth state: {e}"))?;
-        let state: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let state = base64url(&random_bytes::<16>()?);
+        let verifier = base64url(&random_bytes::<32>()?);
         let url = format!(
-            "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={state}",
+            "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={state}&code_challenge={}&code_challenge_method=S256",
             urlencoding::encode(&config.client_id),
             urlencoding::encode(&redirect_uri),
-            urlencoding::encode(SCOPE)
+            urlencoding::encode(SCOPE),
+            pkce_challenge(&verifier)
         );
         println!(
             "Authorize this app by visiting:\n\n  {url}\n\nWaiting for the browser redirect..."
@@ -101,7 +130,6 @@ impl Auth {
                 }
             }
         };
-        let query = query.as_str();
         let param = |key: &str| {
             query
                 .split('&')
@@ -129,6 +157,7 @@ impl Auth {
                 ("client_secret", &config.client_secret),
                 ("redirect_uri", &redirect_uri),
                 ("grant_type", "authorization_code"),
+                ("code_verifier", &verifier),
             ])
             .send()?
             .error_for_status()
@@ -160,31 +189,75 @@ impl Auth {
         }
     }
 
-    /// Exchange the refresh token for a new access token and persist it.
+    /// Exchange the refresh token for a new access token and persist it. Transient failures are
+    /// retried a few times; a definitive rejection asks the user to re-authorize.
     pub fn refresh(&mut self) -> Result<()> {
-        let resp = self
-            .http
-            .post(TOKEN_URL)
-            .form(&[
-                ("refresh_token", self.creds.refresh_token.as_str()),
-                ("client_id", &self.config.client_id),
-                ("client_secret", &self.config.client_secret),
-                ("grant_type", "refresh_token"),
-            ])
-            .send()?;
-        if !resp.status().is_success() {
+        let mut last = None;
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt)));
+            }
+            let resp = match self
+                .http
+                .post(TOKEN_URL)
+                .form(&[
+                    ("refresh_token", self.creds.refresh_token.as_str()),
+                    ("client_id", &self.config.client_id),
+                    ("client_secret", &self.config.client_secret),
+                    ("grant_type", "refresh_token"),
+                ])
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last = Some(anyhow::anyhow!("token refresh: {e}"));
+                    continue;
+                }
+            };
             let status = resp.status();
+            if status.is_success() {
+                let tok: TokenResponse = resp.json()?;
+                self.creds.access_token = tok.access_token;
+                self.creds.expires_at = now() + tok.expires_in;
+                if let Some(rt) = tok.refresh_token {
+                    self.creds.refresh_token = rt;
+                }
+                return save_json(&self.creds_path, &self.creds);
+            }
             let body = resp.text().unwrap_or_default();
+            if status.is_server_error() || status.as_u16() == 429 {
+                last = Some(anyhow::anyhow!("token refresh failed ({status}): {body}"));
+                continue;
+            }
             bail!(
                 "token refresh failed ({status}): {body}\nRun `dsync init` again to re-authorize."
             );
         }
-        let tok: TokenResponse = resp.json()?;
-        self.creds.access_token = tok.access_token;
-        self.creds.expires_at = now() + tok.expires_in;
-        if let Some(rt) = tok.refresh_token {
-            self.creds.refresh_token = rt;
-        }
-        save_json(&self.creds_path, &self.creds)
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("token refresh failed")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_matches_rfc4648() {
+        assert_eq!(base64url(b""), "");
+        assert_eq!(base64url(b"f"), "Zg");
+        assert_eq!(base64url(b"fo"), "Zm8");
+        assert_eq!(base64url(b"foo"), "Zm9v");
+        assert_eq!(base64url(b"foob"), "Zm9vYg");
+        assert_eq!(base64url(&[0xfb, 0xff, 0xbf]), "-_-_");
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_example() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let v = base64url(&random_bytes::<32>().unwrap());
+        assert_eq!(v.len(), 43, "verifier length within RFC 7636 bounds");
     }
 }

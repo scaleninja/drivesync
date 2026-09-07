@@ -3,14 +3,20 @@
 // DriveSync (dsync) — https://github.com/scaleninja/drivesync
 
 //! Minimal Google Drive v3 client: list, folder resolution, upload, download, changes feed.
+//!
+//! Reads are retried freely. Creates are not idempotent, so a failed create is reconciled by looking
+//! the name up before trying again; large uploads query their resumable session and continue from
+//! the last byte Drive received.
 use crate::auth::Auth;
-use crate::sync::Entry;
+use crate::sync::{Entry, Existing, PART_SUFFIX};
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Body, Client, RequestBuilder, Response};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::{Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +61,15 @@ impl File {
             is_dir: self.is_folder(),
             id: Some(self.id.clone()),
             native_doc: self.is_native_doc(),
+            unreadable: false,
+        }
+    }
+    fn as_existing(&self) -> Existing {
+        let e = self.to_entry();
+        Existing {
+            id: self.id.clone(),
+            mtime_ms: e.mtime_ms,
+            md5: e.md5,
         }
     }
 }
@@ -94,7 +109,48 @@ struct ListResponse {
     files: Vec<File>,
 }
 
+/// A non-success response from Drive.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub body: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Drive API error {}: {}", self.status, self.body.trim())
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// Transient failures worth another attempt: network errors, 429, 5xx, Drive's 403 rate limits.
+fn retryable(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<ApiError>() {
+        Some(api) => api.retryable,
+        None => e.downcast_ref::<reqwest::Error>().is_some(),
+    }
+}
+
+fn api_error(status: StatusCode, body: String) -> ApiError {
+    let rate_limited = status == StatusCode::FORBIDDEN && body.contains("ateLimitExceeded");
+    ApiError {
+        status,
+        retryable: status == StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+            || rate_limited,
+        body,
+    }
+}
+
 type Build<'a> = &'a dyn Fn(&Client) -> Result<RequestBuilder>;
+
+enum Session {
+    Complete(File),
+    Offset(u64),
+    Gone,
+}
 
 /// Cheap to clone and safe to share between worker threads.
 #[derive(Clone)]
@@ -111,45 +167,53 @@ impl Drive {
         }
     }
 
-    /// Send with a bearer token. Refreshes once on 401; retries with exponential backoff on
-    /// network errors, 429, 5xx and Drive's 403 rate-limit responses.
-    fn send(&self, build: Build) -> Result<Response> {
-        self.request(build, true)
+    /// One attempt with a bearer token (refreshing once on 401). Returns the response whatever its status.
+    fn raw(&self, build: Build) -> Result<Response> {
+        let token = self.auth.lock().unwrap().token()?;
+        let resp = build(&self.http)?.bearer_auth(&token).send()?;
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        self.auth.lock().unwrap().refresh_if_stale(&token)?;
+        let token = self.auth.lock().unwrap().token()?;
+        Ok(build(&self.http)?.bearer_auth(&token).send()?)
     }
 
+    /// Send and require success. With `retry`, transient failures back off and try again; this is
+    /// only safe for idempotent requests.
     fn request(&self, build: Build, retry: bool) -> Result<Response> {
-        let mut refreshed = false;
         let attempts = if retry { MAX_ATTEMPTS } else { 1 };
+        let mut last: Option<anyhow::Error> = None;
         for attempt in 0..attempts {
-            let token = self.auth.lock().unwrap().token()?;
-            let resp = match build(&self.http)?.bearer_auth(&token).send() {
+            if attempt > 0 {
+                backoff(
+                    attempt - 1,
+                    &last.as_ref().map(ToString::to_string).unwrap_or_default(),
+                );
+            }
+            let resp = match self.raw(build) {
                 Ok(r) => r,
-                Err(e) if attempt + 1 < attempts => {
-                    backoff(attempt, &e.to_string());
+                Err(e) if retryable(&e) => {
+                    last = Some(e);
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             };
             let status = resp.status();
-            if status == StatusCode::UNAUTHORIZED && !refreshed {
-                refreshed = true;
-                self.auth.lock().unwrap().refresh_if_stale(&token)?;
-                continue;
-            }
             if status.is_success() {
                 return Ok(resp);
             }
-            let body = resp.text().unwrap_or_default();
-            let rate_limited = status == StatusCode::FORBIDDEN && body.contains("ateLimitExceeded");
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() || rate_limited)
-                && attempt + 1 < attempts
-            {
-                backoff(attempt, &format!("{status}"));
-                continue;
+            let err = api_error(status, resp.text().unwrap_or_default());
+            if !err.retryable {
+                return Err(err.into());
             }
-            bail!("Drive API error {status}: {body}");
+            last = Some(err.into());
         }
-        bail!("request failed after {attempts} attempt(s)")
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("request failed")))
+    }
+
+    fn send(&self, build: Build) -> Result<Response> {
+        self.request(build, true)
     }
 
     fn query(&self, q: String) -> Result<Vec<File>> {
@@ -196,12 +260,44 @@ impl Drive {
         Ok(files.into_iter().next())
     }
 
+    /// Metadata of one file (also resolves aliases such as `root`).
+    pub fn get_file(&self, id: &str) -> Result<File> {
+        let url = format!("{API}/{id}");
+        Ok(self
+            .send(&move |c| Ok(c.get(&url).query(&[("fields", FIELDS)])))?
+            .json()?)
+    }
+
+    pub fn file_id(&self, alias: &str) -> Result<String> {
+        Ok(self.get_file(alias)?.id)
+    }
+
+    /// Create a folder. Creation is not idempotent, so after a failed attempt the name is looked up
+    /// first: if the create actually went through, that folder is used instead of making another.
     pub fn create_folder(&self, parent_id: &str, name: &str) -> Result<File> {
         let body =
             serde_json::json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id] });
-        Ok(self
-            .send(&move |c| Ok(c.post(API).query(&[("fields", FIELDS)]).json(&body)))?
-            .json()?)
+        let build = |c: &Client| -> Result<RequestBuilder> {
+            Ok(c.post(API).query(&[("fields", FIELDS)]).json(&body))
+        };
+        let mut last = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(f) = self.find_child(parent_id, name, true)? {
+                    return Ok(f);
+                }
+                backoff(
+                    attempt - 1,
+                    &last.as_ref().map(ToString::to_string).unwrap_or_default(),
+                );
+            }
+            match self.request(&build, false) {
+                Ok(resp) => return Ok(resp.json()?),
+                Err(e) if retryable(&e) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("create folder failed")))
     }
 
     /// Resolve `path` (slash-separated, relative to `base_id`) to a folder id, creating folders if asked.
@@ -222,23 +318,30 @@ impl Drive {
         Ok(Some(id))
     }
 
-    /// Upload `local` as `name` under `parent_id`, or replace the content of `existing_id`.
-    /// Small files go in one multipart request; larger ones stream through a resumable session.
+    /// Upload `local` as `name` under `parent_id`, or replace the content of `existing`.
+    /// Before an update the remote file is re-read and must still match what the plan saw.
     pub fn upload(
         &self,
         parent_id: &str,
         name: &str,
-        existing_id: Option<&str>,
+        existing: Option<&Existing>,
         local: &Path,
         modified_time: &str,
     ) -> Result<File> {
         let size = std::fs::metadata(local)?.len();
+        if let Some(ex) = existing {
+            let now = self.get_file(&ex.id)?.to_entry();
+            let md5_changed = matches!((&now.md5, &ex.md5), (Some(a), Some(b)) if a != b);
+            if md5_changed || (now.mtime_ms - ex.mtime_ms).abs() > 1000 {
+                bail!("remote file changed since the plan was made; re-run to re-plan");
+            }
+        }
         let mut meta = serde_json::json!({ "name": name, "modifiedTime": modified_time });
-        if existing_id.is_none() {
+        if existing.is_none() {
             meta["parents"] = serde_json::json!([parent_id]);
         }
-        let url = existing_id.map_or(UPLOAD.to_string(), |id| format!("{UPLOAD}/{id}"));
-        let is_update = existing_id.is_some();
+        let url = existing.map_or(UPLOAD.to_string(), |ex| format!("{UPLOAD}/{}", ex.id));
+        let is_update = existing.is_some();
         let start = move |c: &Client| {
             if is_update {
                 c.patch(&url)
@@ -247,93 +350,203 @@ impl Drive {
             }
         };
 
-        if size <= MULTIPART_LIMIT {
-            let data = std::fs::read(local)?;
-            let boundary = "dsync_boundary_7f3a9c";
-            let mut body = Vec::with_capacity(data.len() + 512);
-            body.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
-            body.extend_from_slice(&data);
-            body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
-            return Ok(self
-                .send(&move |c| {
-                    Ok(start(c)
-                        .query(&[("uploadType", "multipart"), ("fields", FIELDS)])
-                        .header(
-                            "Content-Type",
-                            format!("multipart/related; boundary={boundary}"),
-                        )
-                        .body(body.clone()))
-                })?
-                .json()?);
+        if size > MULTIPART_LIMIT {
+            return self.upload_resumable(&start, &meta, size, local);
         }
-
-        // Resumable: open a session, then PUT the whole file in one streamed request.
-        // A failed PUT restarts with a fresh session rather than resuming mid-stream.
-        let mut last_err = None;
-        for attempt in 0..3 {
-            let init = self.send(&|c| {
-                Ok(start(c)
-                    .query(&[("uploadType", "resumable"), ("fields", FIELDS)])
-                    .header("X-Upload-Content-Type", "application/octet-stream")
-                    .header("X-Upload-Content-Length", size.to_string())
-                    .json(&meta))
-            })?;
-            let session = init
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .context("resumable upload: no session URI")?
-                .to_string();
-            let put = self.request(
-                &|c| {
-                    let file = std::fs::File::open(local)?;
-                    Ok(c.put(&session)
-                        .header(reqwest::header::CONTENT_LENGTH, size)
-                        .body(Body::sized(file, size)))
-                },
-                false,
-            );
-            match put {
-                Ok(resp) => return Ok(resp.json()?),
-                Err(e) => {
-                    backoff(attempt, &e.to_string());
-                    last_err = Some(e);
+        let data = std::fs::read(local)?;
+        let boundary = "dsync_boundary_7f3a9c";
+        let mut body = Vec::with_capacity(data.len() + 512);
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        body.extend_from_slice(&data);
+        body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+        let build = |c: &Client| -> Result<RequestBuilder> {
+            Ok(start(c)
+                .query(&[("uploadType", "multipart"), ("fields", FIELDS)])
+                .header(
+                    "Content-Type",
+                    format!("multipart/related; boundary={boundary}"),
+                )
+                .body(body.clone()))
+        };
+        if is_update {
+            return Ok(self.send(&build)?.json()?); // PATCH of content is idempotent
+        }
+        // Create: reconcile after a failure instead of blindly repeating a non-idempotent POST.
+        let mut last = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(f) = self.find_child(parent_id, name, false)? {
+                    // The create went through but its response was lost; make content and mtime right.
+                    return self.upload(
+                        parent_id,
+                        name,
+                        Some(&f.as_existing()),
+                        local,
+                        modified_time,
+                    );
                 }
+                backoff(
+                    attempt - 1,
+                    &last.as_ref().map(ToString::to_string).unwrap_or_default(),
+                );
+            }
+            match self.request(&build, false) {
+                Ok(resp) => return Ok(resp.json()?),
+                Err(e) if retryable(&e) => last = Some(e),
+                Err(e) => return Err(e),
             }
         }
-        Err(last_err.unwrap()).context("resumable upload failed")
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("upload failed")))
     }
 
-    /// Stream a file's content to `dest` via a temp file that is renamed into place only after the
-    /// bytes have been verified against `expected_md5` (when Drive provides one).
-    pub fn download_to(&self, id: &str, dest: &Path, expected_md5: Option<&str>) -> Result<()> {
-        let url = format!("{API}/{id}");
-        let mut resp = self.send(&move |c| Ok(c.get(&url).query(&[("alt", "media")])))?;
-        let tmp = dest.with_file_name(format!(
-            ".{}{}",
-            dest.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("download"),
-            crate::sync::PART_SUFFIX
-        ));
-        let result = (|| -> Result<()> {
-            let mut writer = HashWriter {
-                inner: std::fs::File::create(&tmp)?,
-                ctx: md5::Context::new(),
+    /// Resumable upload: open a session, stream the file, and after any failure ask the session how
+    /// many bytes it holds so the transfer continues from there rather than from zero.
+    fn upload_resumable(
+        &self,
+        start: &dyn Fn(&Client) -> RequestBuilder,
+        meta: &serde_json::Value,
+        size: u64,
+        local: &Path,
+    ) -> Result<File> {
+        let mut session: Option<String> = None;
+        let mut offset: u64 = 0;
+        let mut last = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                backoff(attempt - 1, &last);
+            }
+            let sess = match &session {
+                Some(s) => s.clone(),
+                None => {
+                    let init = self.send(&|c| {
+                        Ok(start(c)
+                            .query(&[("uploadType", "resumable"), ("fields", FIELDS)])
+                            .header("X-Upload-Content-Type", "application/octet-stream")
+                            .header("X-Upload-Content-Length", size.to_string())
+                            .json(meta))
+                    })?;
+                    let s = init
+                        .headers()
+                        .get(LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .context("resumable upload: no session URI")?
+                        .to_string();
+                    offset = 0;
+                    session = Some(s.clone());
+                    s
+                }
             };
-            resp.copy_to(&mut writer)?;
-            let actual = format!("{:x}", writer.ctx.compute());
-            if let Some(expected) = expected_md5 {
-                if actual != expected {
-                    bail!("checksum mismatch after download (expected {expected}, got {actual})");
+            let put = self.raw(&|c| {
+                let mut file = std::fs::File::open(local)?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut rb = c
+                    .put(&sess)
+                    .header(CONTENT_LENGTH, size - offset)
+                    .body(Body::sized(file, size - offset));
+                if offset > 0 {
+                    rb = rb.header(CONTENT_RANGE, format!("bytes {offset}-{}/{size}", size - 1));
+                }
+                Ok(rb)
+            });
+            match put {
+                Ok(resp) if resp.status().is_success() => return Ok(resp.json()?),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let err = api_error(status, resp.text().unwrap_or_default());
+                    if !err.retryable
+                        && status != StatusCode::NOT_FOUND
+                        && status != StatusCode::GONE
+                    {
+                        return Err(err.into());
+                    }
+                    last = err.to_string();
+                }
+                Err(e) if retryable(&e) => last = e.to_string(),
+                Err(e) => return Err(e),
+            }
+            match self.session_status(&sess, size)? {
+                Session::Complete(f) => return Ok(f),
+                Session::Offset(o) => offset = o,
+                Session::Gone => session = None,
+            }
+        }
+        bail!("resumable upload failed after {MAX_ATTEMPTS} attempts: {last}")
+    }
+
+    /// Ask a resumable session what it has received.
+    fn session_status(&self, session: &str, size: u64) -> Result<Session> {
+        let resp = self.raw(&|c| {
+            Ok(c.put(session)
+                .header(CONTENT_LENGTH, 0)
+                .header(CONTENT_RANGE, format!("bytes */{size}")))
+        })?;
+        match resp.status() {
+            s if s.is_success() => Ok(Session::Complete(resp.json()?)),
+            StatusCode::PERMANENT_REDIRECT => {
+                let received = resp
+                    .headers()
+                    .get(RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_range_end)
+                    .map_or(0, |end| end + 1);
+                Ok(Session::Offset(received.min(size)))
+            }
+            StatusCode::NOT_FOUND | StatusCode::GONE => Ok(Session::Gone),
+            s => Err(api_error(s, resp.text().unwrap_or_default()).into()),
+        }
+    }
+
+    /// Download into a fresh, exclusively created temp file next to `dest`, verify it against
+    /// `expected_md5`, and return the temp path. The caller validates the destination and renames.
+    pub fn download_to_temp(
+        &self,
+        id: &str,
+        dest: &Path,
+        expected_md5: Option<&str>,
+    ) -> Result<PathBuf> {
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
+        let tmp = dest.with_file_name(format!(".{name}{PART_SUFFIX}"));
+        let mut last = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                backoff(
+                    attempt - 1,
+                    &last.as_ref().map(ToString::to_string).unwrap_or_default(),
+                );
+            }
+            match self.try_download(id, &tmp, expected_md5) {
+                Ok(()) => return Ok(tmp),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    if e.downcast_ref::<ApiError>().is_some_and(|a| !a.retryable) {
+                        return Err(e);
+                    }
+                    last = Some(e);
                 }
             }
-            Ok(std::fs::rename(&tmp, dest)?)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
         }
-        result
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("download failed")))
+    }
+
+    fn try_download(&self, id: &str, tmp: &Path, expected_md5: Option<&str>) -> Result<()> {
+        let url = format!("{API}/{id}");
+        let mut resp = self.send(&move |c| Ok(c.get(&url).query(&[("alt", "media")])))?;
+        let mut writer = HashWriter {
+            inner: open_temp_exclusive(tmp)?,
+            ctx: md5::Context::new(),
+        };
+        resp.copy_to(&mut writer).context("reading download body")?;
+        writer.inner.sync_all()?;
+        let actual = format!("{:x}", writer.ctx.compute());
+        if let Some(expected) = expected_md5 {
+            if actual != expected {
+                bail!("checksum mismatch after download (expected {expected}, got {actual})");
+            }
+        }
+        Ok(())
     }
 
     /// Token marking "now" in the Changes feed.
@@ -374,15 +587,6 @@ impl Drive {
                 (None, None) => bail!("changes response without newStartPageToken"),
             }
         }
-    }
-
-    /// Resolve an alias such as `root` to the real file id.
-    pub fn file_id(&self, alias: &str) -> Result<String> {
-        let url = format!("{API}/{alias}");
-        let f: File = self
-            .send(&move |c| Ok(c.get(&url).query(&[("fields", FIELDS)])))?
-            .json()?;
-        Ok(f.id)
     }
 
     /// List the whole subtree under `root_id` with one paginated query over My Drive (rclone's
@@ -468,6 +672,36 @@ impl Drive {
     }
 }
 
+/// Create the temp file for a download: any stale file or symlink at that path is removed first,
+/// then the file is created exclusively (never through a link) with private permissions.
+fn open_temp_exclusive(tmp: &Path) -> Result<std::fs::File> {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing stale {}", tmp.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(tmp)
+        .with_context(|| format!("creating {}", tmp.display()))
+}
+
+/// Last byte index from a `Range: bytes=0-N` header.
+fn parse_range_end(header: &str) -> Option<u64> {
+    header
+        .trim()
+        .strip_prefix("bytes=")?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
+}
+
 /// Writes through to `inner` while computing an MD5 of everything written.
 struct HashWriter<W: std::io::Write> {
     inner: W,
@@ -524,7 +758,7 @@ fn assemble_tree(
 fn backoff(attempt: u32, why: &str) {
     let mut jitter = [0u8; 2];
     let _ = getrandom::getrandom(&mut jitter);
-    let ms = 500 * 2u64.pow(attempt) + u64::from(u16::from_le_bytes(jitter)) % 500;
+    let ms = 500 * 2u64.pow(attempt.min(6)) + u64::from(u16::from_le_bytes(jitter)) % 500;
     crate::progress::eprintln(&format!("  retrying in {:.1}s ({why})", ms as f64 / 1000.0));
     std::thread::sleep(Duration::from_millis(ms));
 }
@@ -577,6 +811,58 @@ mod tests {
     }
 
     #[test]
+    fn range_header_parsing() {
+        assert_eq!(parse_range_end("bytes=0-42"), Some(42));
+        assert_eq!(parse_range_end(" bytes=0-0 "), Some(0));
+        assert_eq!(parse_range_end("bytes=0-"), None);
+        assert_eq!(parse_range_end("garbage"), None);
+    }
+
+    #[test]
+    fn api_error_classification() {
+        assert!(api_error(StatusCode::TOO_MANY_REQUESTS, String::new()).retryable);
+        assert!(api_error(StatusCode::BAD_GATEWAY, String::new()).retryable);
+        assert!(api_error(StatusCode::FORBIDDEN, "userRateLimitExceeded".into()).retryable);
+        assert!(!api_error(StatusCode::FORBIDDEN, "storageQuotaExceeded".into()).retryable);
+        assert!(!api_error(StatusCode::NOT_FOUND, String::new()).retryable);
+        let e: anyhow::Error = api_error(StatusCode::NOT_FOUND, "x".into()).into();
+        assert!(!retryable(&e));
+        assert!(!retryable(&anyhow::anyhow!("plain")));
+    }
+
+    #[test]
+    fn temp_file_is_created_exclusively_and_privately() {
+        let dir = std::env::temp_dir().join(format!("dsync_tmp_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(".f.txt.dsync-part");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A pre-existing symlink at the temp path must not be followed: it is replaced.
+            let outside = dir.join("outside.txt");
+            std::fs::write(&outside, "keep").unwrap();
+            std::os::unix::fs::symlink(&outside, &tmp).unwrap();
+            let f = open_temp_exclusive(&tmp).unwrap();
+            drop(f);
+            assert!(!std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+            assert_eq!(
+                std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // A stale regular temp file is replaced too.
+        std::fs::write(&tmp, "stale").unwrap();
+        drop(open_temp_exclusive(&tmp).unwrap());
+        assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn tree_assembly_handles_spaces_depth_duplicates_and_bad_names() {
         let mut by_parent: BTreeMap<String, Vec<File>> = BTreeMap::new();
         by_parent.insert(
@@ -611,6 +897,7 @@ mod tests {
             ]
         );
         assert_eq!(all["top level.txt"].id.as_deref(), Some("f1")); // first duplicate wins
+        assert_eq!(all["top level.txt"].size, Some(42));
         assert!(all["My Documents/sub folder"].is_dir);
 
         let shallow = assemble_tree(&by_parent, "ROOT", 2);

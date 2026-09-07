@@ -2,19 +2,22 @@
 // Copyright (c) 2026 ScaleNinja
 // DriveSync (dsync) — https://github.com/scaleninja/drivesync
 
-//! Local walking, local/remote comparison, diff-style rendering, and the push/pull engines.
+//! Local walking, local/remote comparison, plan listing, and the push/pull engines.
 //!
-//! Comparison strategy (rsync/rclone style): equal MD5 means identical; differing sizes mean
-//! different; equal size and equal mtime (within tolerance) is assumed identical without hashing;
-//! only equal size with differing mtimes needs a local hash, which is cached keyed by stat.
+//! Comparison: equal MD5 means identical (Drive supplies remote MD5s; local ones are computed and
+//! cached by stat); differing sizes mean different; only when neither settles it do mtimes decide.
+//!
+//! Safety rule: the plan is made from a snapshot, so the executor re-validates every destination
+//! against the live filesystem (or Drive) immediately before writing, refuses to write through
+//! symlinks or into reserved paths, and never deletes anything.
 use crate::cache::Cache;
 use crate::config::{GD_DIR, IGNORE_FILE};
 use crate::drive::Drive;
 use crate::progress::{self, Spinner};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ignore::gitignore::Gitignore;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
@@ -31,6 +34,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub id: Option<String>,
     pub native_doc: bool,
+    /// Local file that could not be read when hashing; never transferred, reported as an error.
+    pub unreadable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,6 +46,10 @@ pub enum Change {
     RemoteNewer,
     /// Content differs but the modification times are equal.
     Modified,
+    /// A folder on one side and a file on the other.
+    TypeMismatch,
+    /// The local file could not be read.
+    Unreadable,
 }
 
 impl Change {
@@ -51,6 +60,8 @@ impl Change {
             Change::LocalNewer => "local newer",
             Change::RemoteNewer => "remote newer",
             Change::Modified => "content differs, same mtime",
+            Change::TypeMismatch => "folder on one side, file on the other",
+            Change::Unreadable => "local file could not be read",
         }
     }
 }
@@ -65,6 +76,14 @@ pub fn fmt_ms(ms: i64) -> String {
     DateTime::<Utc>::from_timestamp_millis(ms)
         .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
         .unwrap_or_else(|| "-".into())
+}
+
+fn mtime_ms_of(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Drive allows names that cannot be mapped onto a local path ("/", ".", "..", empty).
@@ -82,6 +101,24 @@ pub fn join_rel(prefix: &str, name: &str) -> String {
 
 pub fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+}
+
+/// Printable form of a path: control characters are escaped so untrusted names cannot drive the terminal.
+pub fn display(path: &str) -> String {
+    path.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Paths dsync owns or must never write: anything under `.gd/` and download temp files.
+pub fn is_reserved(rel: &str) -> bool {
+    rel.split('/').any(|c| c == GD_DIR) || rel.ends_with(PART_SUFFIX)
 }
 
 /// Normalize `path` (relative to cwd) to an absolute path without touching the filesystem.
@@ -126,27 +163,43 @@ pub fn rel_path(root: &Path, abs: &Path) -> Result<String> {
 }
 
 pub fn load_ignore(root: &Path) -> Gitignore {
-    let (gi, _) = Gitignore::new(root.join(IGNORE_FILE));
+    let (gi, err) = Gitignore::new(root.join(IGNORE_FILE));
+    if let Some(e) = err {
+        progress::eprintln(&format!("warning: problem in {IGNORE_FILE}: {e}"));
+    }
     gi
 }
 
 fn is_ignored(root: &Path, ignore: &Gitignore, path: &Path, is_dir: bool) -> bool {
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(PART_SUFFIX))
-    {
-        return true; // leftover from an interrupted download
+    if let Ok(rel) = path.strip_prefix(root) {
+        if rel.components().any(|c| c.as_os_str() == GD_DIR) {
+            return true;
+        }
+        if rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(PART_SUFFIX))
+        {
+            return true; // leftover from an interrupted download
+        }
     }
-    path.strip_prefix(root)
-        .ok()
-        .and_then(|r| r.components().next())
-        .is_some_and(|c| c.as_os_str() == GD_DIR)
-        || ignore.matched_path_or_any_parents(path, is_dir).is_ignore()
+    ignore.matched_path_or_any_parents(path, is_dir).is_ignore()
 }
 
-/// Walk the local subtree at `base` (an absolute path under `root`), keyed by path relative to `root`.
-/// Only stat information is collected; hashes are filled in later, and only where needed.
+/// Drop remote entries the local side would never scan, so nothing can be pulled over an ignored
+/// or reserved local path, and nothing ignored is ever compared.
+pub fn filter_remote(root: &Path, ignore: &Gitignore, remote: &mut BTreeMap<String, Entry>) {
+    remote.retain(|rel, e| {
+        !is_reserved(rel)
+            && !ignore
+                .matched_path_or_any_parents(root.join(rel), e.is_dir)
+                .is_ignore()
+    });
+}
+
+/// Walk the local subtree at `base` (an absolute path under `root`), keyed by path relative to
+/// `root`. `depth` counts levels from the root on both sides. Only stat information is collected;
+/// hashes are filled in later, and only where needed. Symlinks and non-regular files are skipped.
 pub fn local_walk(
     root: &Path,
     base: &Path,
@@ -154,12 +207,30 @@ pub fn local_walk(
     ignore: &Gitignore,
 ) -> Result<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();
-    if !base.exists() {
-        return Ok(out);
+    let base_meta = match std::fs::symlink_metadata(base) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", base.display())),
+    };
+    if base_meta.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink; dsync does not follow symlinks",
+            base.display()
+        );
     }
-    let mut walker = WalkDir::new(base).min_depth(usize::from(base.is_dir()));
-    if depth >= 0 && base.is_dir() {
-        walker = walker.max_depth(depth as usize);
+    let base_rel = rel_path(root, base)?;
+    let base_level = if base_rel.is_empty() {
+        0
+    } else {
+        base_rel.matches('/').count() as i32 + 1
+    };
+    if depth >= 0 && base_level > depth {
+        bail!("{base_rel} is deeper than the configured depth {depth}");
+    }
+    // The selected directory is itself part of the snapshot (the root never is).
+    let mut walker = WalkDir::new(base).min_depth(usize::from(base_rel.is_empty()));
+    if depth >= 0 && base_meta.is_dir() {
+        walker = walker.max_depth((depth - base_level) as usize);
     }
     for entry in walker.into_iter().filter_entry(|e| {
         !e.file_type().is_symlink() && !is_ignored(root, ignore, e.path(), e.file_type().is_dir())
@@ -173,20 +244,24 @@ pub fn local_walk(
                 continue;
             }
         };
-        let mtime_ms = meta
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let ft = meta.file_type();
+        if !ft.is_file() && !ft.is_dir() {
+            progress::eprintln(&format!(
+                "! skip     {}  (not a regular file)",
+                display(&rel)
+            ));
+            continue;
+        }
+        if is_reserved(&rel) {
+            continue;
+        }
         out.insert(
             rel,
             Entry {
-                mtime_ms,
-                size: meta.is_file().then_some(meta.len()),
-                md5: None,
-                is_dir: meta.is_dir(),
-                id: None,
-                native_doc: false,
+                mtime_ms: mtime_ms_of(&meta),
+                size: ft.is_file().then_some(meta.len()),
+                is_dir: ft.is_dir(),
+                ..Default::default()
             },
         );
     }
@@ -236,14 +311,16 @@ fn needs_hash(l: &Entry, r: &Entry, fast: bool) -> bool {
         && (!fast || !within_tolerance(l, r))
 }
 
-/// Compute (or fetch from the stat-keyed cache) the MD5 of every local file whose comparison
-/// depends on it. Hashing runs on `threads` workers; results are stored back into the cache.
+/// Compute (or fetch from the stat-keyed cache, unless `verify`) the MD5 of every local file whose
+/// comparison depends on it. Hashing runs on `threads` workers; results are stored in the cache.
+/// A file that cannot be read is marked unreadable and is never transferred.
 pub fn fill_hashes(
     root: &Path,
     cache: &Cache,
     local: &mut BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
     fast: bool,
+    verify: bool,
     threads: usize,
 ) -> Result<()> {
     let todo: Vec<(String, u64, i64)> = local
@@ -260,12 +337,18 @@ pub fn fill_hashes(
         "Hashing 0/{total} local files ({threads} threads)"
     ));
     let results = parallel(todo, threads, |(path, size, mtime_ms)| {
-        let result = match cache.local_hash(&path, size, mtime_ms) {
-            Ok(Some(md5)) => Ok(md5),
-            _ => file_md5(&root.join(&path)).inspect(|md5| {
+        let cached = if verify {
+            None
+        } else {
+            cache.local_hash(&path, size, mtime_ms).ok().flatten()
+        };
+        let result = match cached {
+            Some(md5) => Ok(md5),
+            None => file_md5(&root.join(&path)).inspect(|md5| {
                 if let Err(e) = cache.set_local_hash(&path, size, mtime_ms, md5) {
                     progress::eprintln(&format!(
-                        "warning: hash cache update failed for {path}: {e:#}"
+                        "warning: hash cache update failed for {}: {e:#}",
+                        display(&path)
                     ));
                 }
             }),
@@ -278,12 +361,47 @@ pub fn fill_hashes(
     });
     spinner.finish();
     for (path, r) in results {
+        let entry = local.get_mut(&path).expect("hashed path exists");
         match r {
-            Ok(md5) => local.get_mut(&path).expect("hashed path exists").md5 = Some(md5),
-            Err(e) => progress::eprintln(&format!("warning: could not hash {path}: {e:#}")),
+            Ok(md5) => entry.md5 = Some(md5),
+            Err(e) => {
+                progress::eprintln(&format!("error: could not read {}: {e:#}", display(&path)));
+                entry.unreadable = true;
+            }
         }
     }
     Ok(())
+}
+
+/// Paths that collide with another path when case is ignored, including everything below a
+/// colliding folder. On a case-insensitive filesystem these map to one local file and must not
+/// be transferred.
+pub fn case_collisions(
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+) -> BTreeSet<String> {
+    let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for p in local.keys().chain(remote.keys()) {
+        groups.entry(p.to_lowercase()).or_default().insert(p);
+    }
+    let roots: BTreeSet<&str> = groups
+        .values()
+        .filter(|g| g.len() > 1)
+        .flatten()
+        .copied()
+        .collect();
+    local
+        .keys()
+        .chain(remote.keys())
+        .filter(|p| roots.contains(p.as_str()) || ancestors(p).any(|a| roots.contains(a)))
+        .cloned()
+        .collect()
+}
+
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    path.char_indices()
+        .filter(|&(_, c)| c == '/')
+        .map(move |(i, _)| &path[..i])
 }
 
 /// Compare two snapshots; returns only paths that differ.
@@ -295,7 +413,9 @@ pub fn diff(
     for (path, l) in local {
         match remote.get(path) {
             None => out.push((path.clone(), Change::LocalOnly)),
-            Some(r) if l.is_dir || r.is_dir => {}
+            Some(_) if l.unreadable => out.push((path.clone(), Change::Unreadable)),
+            Some(r) if l.is_dir != r.is_dir => out.push((path.clone(), Change::TypeMismatch)),
+            Some(_) if l.is_dir => {}
             Some(r) => match same_content(l, r) {
                 Some(true) => {}
                 _ if l.mtime_ms > r.mtime_ms + MTIME_TOLERANCE_MS => {
@@ -316,6 +436,14 @@ pub fn diff(
     out
 }
 
+/// What the plan saw on Drive for a file that will be updated; re-checked before the upload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Existing {
+    pub id: String,
+    pub mtime_ms: i64,
+    pub md5: Option<String>,
+}
+
 /// One unit of work produced by planning and executed after confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -324,29 +452,50 @@ pub enum Action {
     },
     Upload {
         path: String,
-        existing_id: Option<String>,
+        existing: Option<Existing>,
         mtime_ms: i64,
     },
+    /// `expected_local` is the (size, mtime) the plan saw locally, or None if the file was absent;
+    /// the destination must still match right before it is replaced.
     Download {
         path: String,
         id: String,
         mtime_ms: i64,
         md5: Option<String>,
+        expected_local: Option<(u64, i64)>,
     },
 }
 
-/// A path that was deliberately left alone, with the reason.
+impl Action {
+    #[cfg(test)]
+    pub fn path(&self) -> &str {
+        match self {
+            Action::Mkdir { path }
+            | Action::Upload { path, .. }
+            | Action::Download { path, .. } => path,
+        }
+    }
+}
+
+/// A path that was left alone, with the reason.
 pub type Skip = (String, String);
 
-/// The result of planning: what to do, what was skipped, and what must not be overwritten.
+/// The result of planning.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     pub actions: Vec<Action>,
+    /// Structurally impossible (folder vs file, Google-native document). Not an error.
     pub skips: Vec<Skip>,
-    /// Destination is newer than the source, or content differs with equal mtimes. Never
-    /// transferred unless `--force` was given (in which case they become actions instead).
+    /// Destination is newer than the source, content differs with equal mtimes, or names collide
+    /// on a case-insensitive filesystem. Never transferred unless `--force` (which turns the first
+    /// two kinds into actions; case collisions are never forced).
     pub conflicts: Vec<Skip>,
+    /// Local files that could not be read. Never transferred; the command exits non-zero.
+    pub errors: Vec<Skip>,
 }
+
+const CASE_COLLISION: &str =
+    "name differs only by case from another entry; case-insensitive filesystem";
 
 /// Decide whether a file needs transferring from `src` to `dst`. Returns Some(dst exists).
 fn needs_transfer(
@@ -394,10 +543,16 @@ pub fn plan_push(
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
     force: bool,
+    collisions: &BTreeSet<String>,
 ) -> Plan {
     let mut plan = Plan::default();
     for (path, l) in local {
-        if l.is_dir {
+        if collisions.contains(path) {
+            plan.conflicts.push((path.clone(), CASE_COLLISION.into()));
+        } else if l.unreadable {
+            plan.errors
+                .push((path.clone(), "could not read local file".into()));
+        } else if l.is_dir {
             match remote.get(path) {
                 None => plan.actions.push(Action::Mkdir { path: path.clone() }),
                 Some(r) if !r.is_dir => plan
@@ -413,14 +568,20 @@ pub fn plan_push(
         } else if let Some(exists) =
             needs_transfer(l, remote.get(path), force, path, "remote", &mut plan)
         {
-            let existing_id = if exists {
-                remote.get(path).and_then(|r| r.id.clone())
+            let existing = if exists {
+                remote.get(path).and_then(|r| {
+                    Some(Existing {
+                        id: r.id.clone()?,
+                        mtime_ms: r.mtime_ms,
+                        md5: r.md5.clone(),
+                    })
+                })
             } else {
                 None
             };
             plan.actions.push(Action::Upload {
                 path: path.clone(),
-                existing_id,
+                existing,
                 mtime_ms: l.mtime_ms,
             });
         }
@@ -433,11 +594,18 @@ pub fn plan_pull(
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
     force: bool,
+    collisions: &BTreeSet<String>,
 ) -> Plan {
     let mut plan = Plan::default();
     for (path, r) in remote {
-        if r.is_dir {
-            match local.get(path) {
+        let l = local.get(path);
+        if collisions.contains(path) {
+            plan.conflicts.push((path.clone(), CASE_COLLISION.into()));
+        } else if l.is_some_and(|l| l.unreadable) {
+            plan.errors
+                .push((path.clone(), "could not read local file".into()));
+        } else if r.is_dir {
+            match l {
                 None => plan.actions.push(Action::Mkdir { path: path.clone() }),
                 Some(l) if !l.is_dir => plan
                     .skips
@@ -449,12 +617,13 @@ pub fn plan_pull(
                 path.clone(),
                 "Google-native document; export not supported".into(),
             ));
-        } else if needs_transfer(r, local.get(path), force, path, "local", &mut plan).is_some() {
+        } else if needs_transfer(r, l, force, path, "local", &mut plan).is_some() {
             plan.actions.push(Action::Download {
                 path: path.clone(),
                 id: r.id.clone().unwrap_or_default(),
                 mtime_ms: r.mtime_ms,
                 md5: r.md5.clone(),
+                expected_local: l.and_then(|l| Some((l.size?, l.mtime_ms))),
             });
         }
     }
@@ -463,7 +632,7 @@ pub fn plan_pull(
 
 // ---------------------------------------------------------------------------------------------
 // Listing: one line per path in the style of odeke-em/drive.
-//   + added   M modified   - remote only   ! skipped   C conflict
+//   + added   M modified   - remote only   ! skipped   C conflict   E error
 
 pub fn fmt_size(size: Option<u64>) -> String {
     let Some(n) = size else { return "-".into() };
@@ -480,6 +649,7 @@ pub fn fmt_size(size: Option<u64>) -> String {
 
 /// `marker path  note`
 pub fn line(marker: &str, path: &str, note: &str) -> String {
+    let path = display(path);
     if note.is_empty() {
         format!("{marker} {path}")
     } else {
@@ -526,6 +696,22 @@ fn action_line(
     }
 }
 
+/// Interpret a confirmation answer. `None` is end-of-input (no terminal, `< /dev/null`), which is
+/// never consent.
+pub fn parse_answer(input: Option<&str>, default_yes: bool) -> bool {
+    match input {
+        None => false,
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            if s.is_empty() {
+                default_yes
+            } else {
+                s == "y" || s == "yes"
+            }
+        }
+    }
+}
+
 /// Print the plan and ask for confirmation. Conflicts are listed but never transferred; while any
 /// exist the prompt defaults to "no", and `--no-prompt` refuses to proceed at all.
 /// Returns false if there is nothing to do or the user declined.
@@ -544,6 +730,9 @@ pub fn confirm(
     for (path, reason) in &plan.conflicts {
         println!("{}", line("C", path, &format!("conflict: {reason}")));
     }
+    for (path, reason) in &plan.errors {
+        println!("{}", line("E", path, &format!("error: {reason}")));
+    }
     let size_of = |a: &Action| match a {
         Action::Upload { path, .. } => local.get(path).and_then(|e| e.size).unwrap_or(0),
         Action::Download { path, .. } => remote.get(path).and_then(|e| e.size).unwrap_or(0),
@@ -551,8 +740,8 @@ pub fn confirm(
     };
     let is_add = |a: &Action| match a {
         Action::Mkdir { .. } => true,
-        Action::Upload { existing_id, .. } => existing_id.is_none(),
-        Action::Download { path, .. } => !local.contains_key(path),
+        Action::Upload { existing, .. } => existing.is_none(),
+        Action::Download { expected_local, .. } => expected_local.is_none(),
     };
     let (adds, mods): (Vec<_>, Vec<_>) = plan.actions.iter().partition(|a| is_add(a));
     if !adds.is_empty() {
@@ -572,17 +761,20 @@ pub fn confirm(
     if !plan.skips.is_empty() {
         println!("Skip count {}", plan.skips.len());
     }
+    if !plan.errors.is_empty() {
+        println!("Error count {}", plan.errors.len());
+    }
     if !plan.conflicts.is_empty() {
         println!("Conflict count {}", plan.conflicts.len());
-        println!("Conflicts are never overwritten: both sides differ and the destination is not older.\nResolve them manually (see `dsync diff`), or re-run with --force to overwrite.");
+        println!("Conflicts are never overwritten: both sides differ and the destination is not older, or names collide.\nResolve them manually (see `dsync diff`), or re-run with --force to overwrite newer/modified files.");
         if no_prompt {
-            anyhow::bail!("{} conflict(s); refusing to proceed without a prompt (resolve manually or use --force)", plan.conflicts.len());
+            bail!("{} conflict(s); refusing to proceed without a prompt (resolve manually or use --force)", plan.conflicts.len());
         }
     }
     if plan.actions.is_empty() {
         println!(
             "{}",
-            if plan.skips.is_empty() && plan.conflicts.is_empty() {
+            if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
                 "Everything is up to date."
             } else {
                 "Nothing to transfer."
@@ -604,13 +796,11 @@ pub fn confirm(
     print!("{question}");
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    let answer = answer.trim().to_ascii_lowercase();
-    Ok(if answer.is_empty() {
-        default_yes
-    } else {
-        answer == "y" || answer == "yes"
-    })
+    let read = std::io::stdin().read_line(&mut answer)?;
+    Ok(parse_answer(
+        (read > 0).then_some(answer.as_str()),
+        default_yes,
+    ))
 }
 
 /// One line per differing path for `dsync diff`, with both modification times.
@@ -621,17 +811,16 @@ pub fn diff_line(
     remote: Option<&Entry>,
 ) -> String {
     let stamp = |e: Option<&Entry>| e.map(|e| fmt_ms(e.mtime_ms)).unwrap_or_else(|| "-".into());
+    let what = |e: Option<&Entry>| match e {
+        Some(e) if e.is_dir => "folder".to_string(),
+        Some(e) => fmt_size(e.size),
+        None => "-".into(),
+    };
     match change {
-        Change::LocalOnly => line(
-            "+",
-            path,
-            &format!("local only, {}", fmt_size(local.and_then(|e| e.size))),
-        ),
-        Change::RemoteOnly => line(
-            "-",
-            path,
-            &format!("remote only, {}", fmt_size(remote.and_then(|e| e.size))),
-        ),
+        Change::LocalOnly => line("+", path, &format!("local only, {}", what(local))),
+        Change::RemoteOnly => line("-", path, &format!("remote only, {}", what(remote))),
+        Change::TypeMismatch => line("!", path, Change::TypeMismatch.label()),
+        Change::Unreadable => line("E", path, Change::Unreadable.label()),
         c => line(
             "M",
             path,
@@ -643,6 +832,96 @@ pub fn diff_line(
             ),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Filesystem guards: the executor never trusts the plan's view of the destination.
+
+/// Every ancestor of `rel` inside the workspace must be a real directory or absent: no symlinks,
+/// so a write can never land outside the workspace. Reserved paths are refused outright.
+pub fn guard_parents(root: &Path, rel: &str) -> Result<()> {
+    if is_reserved(rel) {
+        bail!("refusing to write reserved path {}", display(rel));
+    }
+    let mut cur = root.to_path_buf();
+    let comps: Vec<&str> = rel.split('/').collect();
+    for c in &comps[..comps.len().saturating_sub(1)] {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => bail!(
+                "{} is a symlink; refusing to write through it",
+                cur.display()
+            ),
+            Ok(m) if !m.is_dir() => bail!("{} is not a directory", cur.display()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The destination file itself, checked immediately before it is replaced: not a symlink, and
+/// still exactly what the plan saw (`expected` = (size, mtime)), or still absent if the plan
+/// expected nothing there.
+pub fn guard_file(dest: &Path, expected: Option<(u64, i64)>) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_symlink() => {
+            bail!("destination is a symlink; refusing to replace it")
+        }
+        Ok(m) => {
+            let Some((size, mtime_ms)) = expected else {
+                bail!("destination appeared after the plan was made; re-run to re-plan")
+            };
+            if !m.is_file() {
+                bail!("destination is not a regular file");
+            }
+            if m.len() != size || mtime_ms_of(&m) != mtime_ms {
+                bail!("destination changed since the plan was made; re-run to re-plan");
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if expected.is_some() {
+                bail!("destination disappeared since the plan was made; re-run to re-plan");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Move a verified temp file into place: the destination is re-checked, an existing file's
+/// permissions are kept (new files get 0644), and the remote mtime is applied.
+pub fn finalize_download(
+    tmp: &Path,
+    dest: &Path,
+    expected: Option<(u64, i64)>,
+    mtime_ms: i64,
+) -> Result<()> {
+    let result = (|| -> Result<()> {
+        guard_file(dest, expected)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dest)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0o644);
+            std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(tmp, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result?;
+    filetime::set_file_mtime(
+        dest,
+        filetime::FileTime::from_unix_time(
+            mtime_ms.div_euclid(1000),
+            (mtime_ms.rem_euclid(1000) * 1_000_000) as u32,
+        ),
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -700,9 +979,9 @@ pub fn exec_push(
                 .push(path),
             Action::Upload {
                 path,
-                existing_id,
+                existing,
                 mtime_ms,
-            } => uploads.push((path, existing_id, mtime_ms)),
+            } => uploads.push((path, existing, mtime_ms)),
             Action::Download { .. } => unreachable!(),
         }
     }
@@ -719,7 +998,8 @@ pub fn exec_push(
                     Some(parent_id) => batch.push((path, parent_id.clone())),
                     None => {
                         progress::eprintln(&format!(
-                            "x failed   {path}/: parent folder was not created"
+                            "x failed   {}/: parent folder was not created",
+                            display(&path)
                         ));
                         failures += 1;
                     }
@@ -731,12 +1011,13 @@ pub fn exec_push(
                     Ok(f) => {
                         if let Err(e) = cache.upsert(&path, &f.to_entry()) {
                             progress::eprintln(&format!(
-                                "warning: cache update failed for {path}: {e:#}"
+                                "warning: cache update failed for {}: {e:#}",
+                                display(&path)
                             ));
                         }
-                        progress::println(&format!("+ mkdir    {path}/"));
+                        progress::println(&format!("+ mkdir    {}/", display(&path)));
                     }
-                    Err(e) => progress::eprintln(&format!("x failed   {path}/: {e:#}")),
+                    Err(e) => progress::eprintln(&format!("x failed   {}/: {e:#}", display(&path))),
                 }
                 spinner.set(format!(
                     "Creating folders {}/{total_dirs} ({threads} streams)",
@@ -758,11 +1039,14 @@ pub fn exec_push(
 
     // Phase 2: files, in parallel. Skip anything whose parent folder failed to be created.
     let mut jobs = Vec::new();
-    for (path, existing_id, mtime_ms) in uploads {
+    for (path, existing, mtime_ms) in uploads {
         match folder_ids.get(parent_of(&path)) {
-            Some(parent_id) => jobs.push((path, parent_id.clone(), existing_id, mtime_ms)),
+            Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms)),
             None => {
-                progress::eprintln(&format!("x failed   {path}: parent folder was not created"));
+                progress::eprintln(&format!(
+                    "x failed   {}: parent folder was not created",
+                    display(&path)
+                ));
                 failures += 1;
             }
         }
@@ -770,46 +1054,68 @@ pub fn exec_push(
     let total = jobs.len();
     let done = AtomicUsize::new(0);
     let spinner = Spinner::start(&format!("Uploading 0/{total} ({threads} streams)"));
-    let results = parallel(jobs, threads, |(path, parent_id, existing_id, mtime_ms)| {
-        let result = drive.upload(
-            &parent_id,
-            path.rsplit('/').next().unwrap(),
-            existing_id.as_deref(),
-            &root.join(&path),
-            &fmt_ms(mtime_ms),
-        );
-        match &result {
-            Ok(f) => {
-                if let Err(e) = cache.upsert(&path, &f.to_entry()) {
-                    progress::eprintln(&format!("warning: cache update failed for {path}: {e:#}"));
+    let results = parallel(
+        jobs,
+        threads,
+        |(path, parent_id, existing, planned_mtime)| {
+            let local_path = root.join(&path);
+            let result = (|| -> Result<crate::drive::File> {
+                // The source is re-read now; if it changed since the plan, its current mtime is what
+                // gets recorded so the next comparison is honest.
+                let meta = std::fs::symlink_metadata(&local_path)?;
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    bail!("source is no longer a regular file");
                 }
-                if let (Some(md5), Ok(meta)) =
-                    (&f.md5_checksum, std::fs::metadata(root.join(&path)))
-                {
+                let mtime_ms = mtime_ms_of(&meta);
+                if mtime_ms != planned_mtime {
+                    progress::eprintln(&format!(
+                        "note: {} changed since the plan was made; uploading its current content",
+                        display(&path)
+                    ));
+                }
+                let f = drive.upload(
+                    &parent_id,
+                    path.rsplit('/').next().unwrap(),
+                    existing.as_ref(),
+                    &local_path,
+                    &fmt_ms(mtime_ms),
+                )?;
+                if let Err(e) = cache.upsert(&path, &f.to_entry()) {
+                    progress::eprintln(&format!(
+                        "warning: cache update failed for {}: {e:#}",
+                        display(&path)
+                    ));
+                }
+                if let Some(md5) = &f.md5_checksum {
                     let _ = cache.set_local_hash(&path, meta.len(), mtime_ms, md5);
                 }
-                progress::println(&format!(
-                    "^ {:<8} {path}",
-                    if existing_id.is_some() {
+                Ok(f)
+            })();
+            match &result {
+                Ok(_) => progress::println(&format!(
+                    "^ {:<8} {}",
+                    if existing.is_some() {
                         "updated"
                     } else {
                         "uploaded"
-                    }
-                ));
+                    },
+                    display(&path)
+                )),
+                Err(e) => progress::eprintln(&format!("x failed   {}: {e:#}", display(&path))),
             }
-            Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
-        }
-        spinner.set(format!(
-            "Uploading {}/{total} ({threads} streams)",
-            done.fetch_add(1, Ordering::SeqCst) + 1
-        ));
-        result.is_err()
-    });
+            spinner.set(format!(
+                "Uploading {}/{total} ({threads} streams)",
+                done.fetch_add(1, Ordering::SeqCst) + 1
+            ));
+            result.is_err()
+        },
+    );
     spinner.finish();
     Ok(failures + results.into_iter().filter(|failed| *failed).count())
 }
 
-/// Execute a pull plan: local folders first, then downloads in parallel. Returns the number of failures.
+/// Execute a pull plan: local folders first, then downloads in parallel. Every write goes through
+/// the filesystem guards. Returns the number of failures.
 pub fn exec_pull(
     drive: &Drive,
     cache: &Cache,
@@ -817,56 +1123,79 @@ pub fn exec_pull(
     actions: Vec<Action>,
     threads: usize,
 ) -> Result<usize> {
+    let mut failures = 0;
     let mut downloads = Vec::new();
     for a in actions {
         match a {
             Action::Mkdir { path } => {
-                std::fs::create_dir_all(root.join(&path))?;
-                progress::println(&format!("+ mkdir    {path}/"));
+                let result = (|| -> Result<()> {
+                    guard_parents(root, &path)?;
+                    let dest = root.join(&path);
+                    match std::fs::symlink_metadata(&dest) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            bail!("{} is a symlink; refusing to use it", dest.display())
+                        }
+                        Ok(m) if !m.is_dir() => {
+                            bail!("{} exists and is not a directory", dest.display())
+                        }
+                        _ => {}
+                    }
+                    std::fs::create_dir_all(&dest)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => progress::println(&format!("+ mkdir    {}/", display(&path))),
+                    Err(e) => {
+                        progress::eprintln(&format!("x failed   {}/: {e:#}", display(&path)));
+                        failures += 1;
+                    }
+                }
             }
             Action::Download {
                 path,
                 id,
                 mtime_ms,
                 md5,
-            } => downloads.push((path, id, mtime_ms, md5)),
+                expected_local,
+            } => downloads.push((path, id, mtime_ms, md5, expected_local)),
             Action::Upload { .. } => unreachable!(),
         }
     }
     let total = downloads.len();
     let done = AtomicUsize::new(0);
     let spinner = Spinner::start(&format!("Downloading 0/{total} ({threads} streams)"));
-    let results = parallel(downloads, threads, |(path, id, mtime_ms, md5)| {
-        let dest = root.join(&path);
-        let result = (|| -> Result<()> {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+    let results = parallel(
+        downloads,
+        threads,
+        |(path, id, mtime_ms, md5, expected_local)| {
+            let dest = root.join(&path);
+            let result = (|| -> Result<()> {
+                guard_parents(root, &path)?;
+                guard_file(&dest, expected_local)?; // cheap early check before spending bandwidth
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = drive.download_to_temp(&id, &dest, md5.as_deref())?;
+                finalize_download(&tmp, &dest, expected_local, mtime_ms)?;
+                if let (Some(md5), Ok(meta)) = (&md5, std::fs::metadata(&dest)) {
+                    let _ = cache.set_local_hash(&path, meta.len(), mtime_ms, md5);
+                    // next diff needs no read
+                }
+                Ok(())
+            })();
+            match &result {
+                Ok(()) => progress::println(&format!("v downloaded {}", display(&path))),
+                Err(e) => progress::eprintln(&format!("x failed   {}: {e:#}", display(&path))),
             }
-            drive.download_to(&id, &dest, md5.as_deref())?;
-            filetime::set_file_mtime(
-                &dest,
-                filetime::FileTime::from_unix_time(
-                    mtime_ms.div_euclid(1000),
-                    (mtime_ms.rem_euclid(1000) * 1_000_000) as u32,
-                ),
-            )?;
-            if let (Some(md5), Ok(meta)) = (&md5, std::fs::metadata(&dest)) {
-                let _ = cache.set_local_hash(&path, meta.len(), mtime_ms, md5); // next diff needs no read
-            }
-            Ok(())
-        })();
-        match &result {
-            Ok(()) => progress::println(&format!("v downloaded {path}")),
-            Err(e) => progress::eprintln(&format!("x failed   {path}: {e:#}")),
-        }
-        spinner.set(format!(
-            "Downloading {}/{total} ({threads} streams)",
-            done.fetch_add(1, Ordering::SeqCst) + 1
-        ));
-        result.is_err()
-    });
+            spinner.set(format!(
+                "Downloading {}/{total} ({threads} streams)",
+                done.fetch_add(1, Ordering::SeqCst) + 1
+            ));
+            result.is_err()
+        },
+    );
     spinner.finish();
-    Ok(results.into_iter().filter(|failed| *failed).count())
+    Ok(failures + results.into_iter().filter(|failed| *failed).count())
 }
 
 #[cfg(test)]
@@ -879,8 +1208,7 @@ mod tests {
             size: (!is_dir).then_some(10),
             md5: md5.map(String::from),
             is_dir,
-            id: None,
-            native_doc: false,
+            ..Default::default()
         }
     }
     fn sized(mtime_ms: i64, size: u64) -> Entry {
@@ -889,6 +1217,15 @@ mod tests {
             size: Some(size),
             ..Default::default()
         }
+    }
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dsync_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn none() -> BTreeSet<String> {
+        BTreeSet::new()
     }
 
     #[test]
@@ -903,19 +1240,29 @@ mod tests {
             ("size_differs.txt".to_string(), sized(1000, 10)),
             ("size_same_time_same.txt".to_string(), sized(1000, 10)),
             ("modified.txt".to_string(), e(1000, Some("m1"), false)),
+            ("typed".to_string(), e(0, None, true)),
+            (
+                "bad.txt".to_string(),
+                Entry {
+                    unreadable: true,
+                    ..sized(1, 1)
+                },
+            ),
         ]
         .into_iter()
         .collect();
         let remote: BTreeMap<_, _> = [
             ("a.txt".to_string(), e(1000, Some("x2"), false)),
             ("b.txt".to_string(), e(5000, Some("y2"), false)),
-            ("same.txt".to_string(), e(1, Some("z"), false)), // md5 equal wins over mtime
-            ("tol.txt".to_string(), e(1000, Some("q2"), false)), // within tolerance and md5 differs -> Modified
+            ("same.txt".to_string(), e(1, Some("z"), false)),
+            ("tol.txt".to_string(), e(1000, Some("q2"), false)),
             ("only_remote.txt".to_string(), e(1, None, false)),
             ("dir".to_string(), e(123, None, true)),
-            ("size_differs.txt".to_string(), sized(1000, 11)), // same mtime, different size -> Modified
-            ("size_same_time_same.txt".to_string(), sized(1500, 10)), // assumed identical, no hash
+            ("size_differs.txt".to_string(), sized(1000, 11)),
+            ("size_same_time_same.txt".to_string(), sized(1500, 10)),
             ("modified.txt".to_string(), e(1000, Some("m2"), false)),
+            ("typed".to_string(), e(0, Some("f"), false)),
+            ("bad.txt".to_string(), sized(1, 1)),
         ]
         .into_iter()
         .collect();
@@ -924,11 +1271,13 @@ mod tests {
             vec![
                 ("a.txt".to_string(), Change::LocalNewer),
                 ("b.txt".to_string(), Change::RemoteNewer),
+                ("bad.txt".to_string(), Change::Unreadable),
                 ("modified.txt".to_string(), Change::Modified),
                 ("only_local.txt".to_string(), Change::LocalOnly),
                 ("only_remote.txt".to_string(), Change::RemoteOnly),
                 ("size_differs.txt".to_string(), Change::Modified),
                 ("tol.txt".to_string(), Change::Modified),
+                ("typed".to_string(), Change::TypeMismatch),
             ]
         );
     }
@@ -939,7 +1288,6 @@ mod tests {
             md5: Some("r".into()),
             ..sized(1000, 10)
         };
-        // Default: verify by MD5 whenever sizes match, regardless of mtime.
         assert!(
             needs_hash(&sized(5000, 10), &remote, false),
             "same size, different mtime"
@@ -952,20 +1300,14 @@ mod tests {
             !needs_hash(&sized(5000, 11), &remote, false),
             "different size: known different"
         );
-        // --fast: rsync quick check, equal size + mtime is trusted.
         assert!(
             needs_hash(&sized(5000, 10), &remote, true),
-            "same size, different mtime"
+            "fast: same size, different mtime"
         );
         assert!(
             !needs_hash(&sized(1500, 10), &remote, true),
-            "same size, same mtime: trusted"
+            "fast: same size, same mtime trusted"
         );
-        assert!(
-            !needs_hash(&sized(5000, 11), &remote, true),
-            "different size"
-        );
-        // Never when there is nothing to compare against or it is already known.
         assert!(
             !needs_hash(&sized(5000, 10), &sized(1000, 10), false),
             "remote has no md5 (native doc)"
@@ -995,15 +1337,13 @@ mod tests {
     }
 
     #[test]
-    fn fill_hashes_uses_and_populates_cache() {
-        let dir = std::env::temp_dir().join(format!("dsync_hash_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn fill_hashes_uses_cache_unless_verifying_and_flags_unreadable() {
+        let dir = tmpdir("hash");
         std::fs::write(dir.join("f.txt"), b"hello").unwrap();
         let cache = Cache::open(&dir.join("cache.db")).unwrap();
         let ignore = load_ignore(&dir);
         let mut local = local_walk(&dir, &dir, -1, &ignore).unwrap();
-        local.remove("cache.db");
+        local.retain(|p, _| p == "f.txt");
         let (size, mtime) = (local["f.txt"].size.unwrap(), local["f.txt"].mtime_ms);
         let remote: BTreeMap<_, _> = [(
             "f.txt".to_string(),
@@ -1016,7 +1356,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        fill_hashes(&dir, &cache, &mut local, &remote, false, 2).unwrap();
+        fill_hashes(&dir, &cache, &mut local, &remote, false, false, 2).unwrap();
         assert_eq!(
             local["f.txt"].md5.as_deref(),
             Some("5d41402abc4b2a76b9719d911017c592")
@@ -1030,13 +1370,40 @@ mod tests {
             None,
             "stat change invalidates"
         );
-        // Poison the cache entry to prove it is used instead of re-reading the file.
+        // Poison the cache entry: default mode trusts it, --verify re-reads the file.
         cache
             .set_local_hash("f.txt", size, mtime, "cached")
             .unwrap();
-        let mut again = local_walk(&dir, &dir, -1, &ignore).unwrap();
-        fill_hashes(&dir, &cache, &mut again, &remote, false, 2).unwrap();
+        let mut again = local.clone();
+        again.get_mut("f.txt").unwrap().md5 = None;
+        fill_hashes(&dir, &cache, &mut again, &remote, false, false, 2).unwrap();
         assert_eq!(again["f.txt"].md5.as_deref(), Some("cached"));
+        let mut verified = local.clone();
+        verified.get_mut("f.txt").unwrap().md5 = None;
+        fill_hashes(&dir, &cache, &mut verified, &remote, false, true, 2).unwrap();
+        assert_eq!(
+            verified["f.txt"].md5.as_deref(),
+            Some("5d41402abc4b2a76b9719d911017c592")
+        );
+        // A file that vanished between scan and hash is flagged, never treated as identical.
+        std::fs::remove_file(dir.join("f.txt")).unwrap();
+        cache.set_local_hash("f.txt", size, mtime, "stale").unwrap();
+        let mut gone = local.clone();
+        gone.get_mut("f.txt").unwrap().md5 = None;
+        fill_hashes(&dir, &cache, &mut gone, &remote, false, true, 2).unwrap();
+        assert!(gone["f.txt"].unreadable);
+        assert_eq!(
+            diff(&gone, &remote),
+            vec![("f.txt".to_string(), Change::Unreadable)]
+        );
+        let plan = plan_push(&gone, &remote, false, &none());
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.errors.len(), 1);
+        assert_eq!(
+            plan_pull(&gone, &remote, true, &none()).errors.len(),
+            1,
+            "even --force never overwrites an unreadable local file"
+        );
         drop(cache);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1107,24 +1474,28 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let plan = plan_push(&local, &remote, false);
+        let plan = plan_push(&local, &remote, false, &none());
         assert_eq!(
             plan.actions,
             vec![
                 Action::Mkdir { path: "d".into() },
                 Action::Upload {
                     path: "d/new.txt".into(),
-                    existing_id: None,
+                    existing: None,
                     mtime_ms: 5000
                 },
                 Action::Upload {
                     path: "newer.txt".into(),
-                    existing_id: Some("id1".into()),
+                    existing: Some(Existing {
+                        id: "id1".into(),
+                        mtime_ms: 1000,
+                        md5: Some("b2".into())
+                    }),
                     mtime_ms: 9000
                 },
             ]
         );
-        assert!(plan.skips.is_empty());
+        assert!(plan.skips.is_empty() && plan.errors.is_empty());
         assert_eq!(
             plan.conflicts,
             vec![
@@ -1132,10 +1503,10 @@ mod tests {
                 (
                     "size_differs.txt".to_string(),
                     "content differs, same mtime".to_string()
-                ),
+                )
             ]
         );
-        let forced = plan_push(&local, &remote, true);
+        let forced = plan_push(&local, &remote, true, &none());
         assert_eq!(
             forced.actions.len(),
             5,
@@ -1143,7 +1514,7 @@ mod tests {
         );
         assert!(forced.conflicts.is_empty());
 
-        let plan = plan_pull(&local, &remote, false);
+        let plan = plan_pull(&local, &remote, false, &none());
         assert_eq!(
             plan.actions,
             vec![
@@ -1151,7 +1522,8 @@ mod tests {
                     path: "older.txt".into(),
                     id: "id2".into(),
                     mtime_ms: 9000,
-                    md5: Some("c2".into())
+                    md5: Some("c2".into()),
+                    expected_local: Some((10, 1000))
                 },
                 Action::Mkdir {
                     path: "rdir".into()
@@ -1160,7 +1532,8 @@ mod tests {
                     path: "rdir/r.txt".into(),
                     id: "id5".into(),
                     mtime_ms: 1,
-                    md5: Some("r".into())
+                    md5: Some("r".into()),
+                    expected_local: None
                 },
             ]
         );
@@ -1176,7 +1549,7 @@ mod tests {
         );
         remote.get_mut("rdir/r.txt").unwrap().native_doc = true;
         assert_eq!(
-            plan_pull(&local, &remote, false).skips,
+            plan_pull(&local, &remote, false, &none()).skips,
             vec![(
                 "rdir/r.txt".to_string(),
                 "Google-native document; export not supported".to_string()
@@ -1195,19 +1568,227 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let p3 = plan_push(&l3, &r3, false);
+        let p3 = plan_push(&l3, &r3, false, &none());
         assert!(p3.actions.is_empty() && p3.conflicts.is_empty() && p3.skips.len() == 1);
         // Folder/file type mismatches are skips, not conflicts.
         let l2: BTreeMap<_, _> = [("x".to_string(), e(0, None, true))].into_iter().collect();
         let r2: BTreeMap<_, _> = [("x".to_string(), e(0, Some("q"), false))]
             .into_iter()
             .collect();
-        assert_eq!(plan_push(&l2, &r2, false).skips.len(), 1);
-        assert_eq!(plan_pull(&l2, &r2, false).skips.len(), 1);
+        assert_eq!(plan_push(&l2, &r2, false, &none()).skips.len(), 1);
+        assert_eq!(plan_pull(&l2, &r2, false, &none()).skips.len(), 1);
     }
 
     #[test]
-    fn listing_lines() {
+    fn case_collisions_are_conflicts_even_with_force() {
+        let local: BTreeMap<_, _> = [
+            (
+                "Report.txt".to_string(),
+                Entry {
+                    md5: Some("new".into()),
+                    ..sized(9000, 10)
+                },
+            ),
+            ("Docs".to_string(), e(0, None, true)),
+            ("Docs/inner.txt".to_string(), sized(1, 1)),
+            ("plain.txt".to_string(), sized(1, 1)),
+        ]
+        .into_iter()
+        .collect();
+        let remote: BTreeMap<_, _> = [
+            (
+                "report.txt".to_string(),
+                Entry {
+                    id: Some("r".into()),
+                    md5: Some("old".into()),
+                    ..sized(1000, 10)
+                },
+            ),
+            (
+                "docs".to_string(),
+                Entry {
+                    id: Some("d".into()),
+                    ..e(0, None, true)
+                },
+            ),
+            (
+                "docs/other.txt".to_string(),
+                Entry {
+                    id: Some("o".into()),
+                    ..sized(1, 1)
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let collisions = case_collisions(&local, &remote);
+        assert_eq!(
+            collisions.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "Docs",
+                "Docs/inner.txt",
+                "Report.txt",
+                "docs",
+                "docs/other.txt",
+                "report.txt"
+            ]
+        );
+        // Without collision detection this pull would replace the newer local Report.txt.
+        let naive = plan_pull(&local, &remote, false, &none());
+        assert!(naive.actions.iter().any(|a| a.path() == "report.txt"));
+        let safe = plan_pull(&local, &remote, true, &collisions);
+        assert!(safe.actions.is_empty());
+        assert_eq!(safe.conflicts.len(), 3);
+        let push = plan_push(&local, &remote, true, &collisions);
+        assert_eq!(
+            push.actions,
+            vec![Action::Upload {
+                path: "plain.txt".into(),
+                existing: None,
+                mtime_ms: 1
+            }]
+        );
+        assert!(case_collisions(&local, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn remote_snapshot_is_filtered_like_the_local_one() {
+        let dir = tmpdir("filter");
+        std::fs::write(dir.join(IGNORE_FILE), "*.log\nprivate/\n").unwrap();
+        let ignore = load_ignore(&dir);
+        let mut remote: BTreeMap<String, Entry> = [
+            ".gd/credentials.json",
+            ".gd/config.json",
+            "nested/.gd/lock",
+            "keep.txt",
+            "debug.log",
+            "private",
+            "private/secret.txt",
+            ".hidden.txt.dsync-part",
+        ]
+        .into_iter()
+        .map(|p| {
+            (
+                p.to_string(),
+                Entry {
+                    is_dir: p == "private",
+                    ..sized(1, 1)
+                },
+            )
+        })
+        .collect();
+        filter_remote(&dir, &ignore, &mut remote);
+        assert_eq!(remote.keys().cloned().collect::<Vec<_>>(), vec!["keep.txt"]);
+        // And the executor refuses reserved paths regardless of what a plan says.
+        assert!(guard_parents(&dir, ".gd/credentials.json").is_err());
+        assert!(guard_parents(&dir, "a/.gd/x").is_err());
+        assert!(guard_parents(&dir, "a/.x.dsync-part").is_err());
+        assert!(guard_parents(&dir, "a/b/c.txt").is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guards_refuse_symlinks_and_stale_destinations() {
+        let dir = tmpdir("guard");
+        let outside = tmpdir("guard_outside");
+        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/file.txt"), "one").unwrap();
+        std::os::unix::fs::symlink(dir.join("real/file.txt"), dir.join("real/link.txt")).unwrap();
+        // Ancestor symlink: writes would land outside the workspace.
+        assert!(guard_parents(&dir, "linked/secret.txt")
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
+        assert!(guard_parents(&dir, "linked/deeper/x.txt").is_err());
+        assert!(guard_parents(&dir, "real/file.txt/child")
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+        assert!(guard_parents(&dir, "real/new.txt").is_ok());
+        assert!(
+            guard_parents(&dir, "brand/new/dir/file.txt").is_ok(),
+            "absent ancestors are fine"
+        );
+        // Destination symlink is never replaced.
+        assert!(guard_file(&dir.join("real/link.txt"), None).is_err());
+        assert!(guard_file(&dir.join("real/link.txt"), Some((3, 0))).is_err());
+        // Destination must match the plan exactly.
+        let m = std::fs::metadata(dir.join("real/file.txt")).unwrap();
+        let expected = Some((m.len(), mtime_ms_of(&m)));
+        assert!(guard_file(&dir.join("real/file.txt"), expected).is_ok());
+        assert!(guard_file(&dir.join("real/file.txt"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("appeared"));
+        assert!(guard_file(
+            &dir.join("real/file.txt"),
+            Some((m.len() + 1, mtime_ms_of(&m)))
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed"));
+        assert!(guard_file(&dir.join("real/missing.txt"), expected)
+            .unwrap_err()
+            .to_string()
+            .contains("disappeared"));
+        assert!(guard_file(&dir.join("real/missing.txt"), None).is_ok());
+        assert!(
+            guard_file(&dir.join("real"), None).is_err(),
+            "a directory is not a valid file destination"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_preserves_permissions_and_detects_concurrent_edits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("finalize");
+        let dest = dir.join("doc.txt");
+        std::fs::write(&dest, "private").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let m = std::fs::metadata(&dest).unwrap();
+        let expected = Some((m.len(), mtime_ms_of(&m)));
+        let tmp = dir.join(".doc.txt.dsync-part");
+        std::fs::write(&tmp, "downloaded").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        finalize_download(&tmp, &dest, expected, 1_700_000_000_500).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "downloaded");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "existing mode kept"
+        );
+        assert_eq!(
+            mtime_ms_of(&std::fs::metadata(&dest).unwrap()),
+            1_700_000_000_500
+        );
+        assert!(!tmp.exists());
+        // The user edits the file after the plan: the download must not clobber it.
+        std::fs::write(&tmp, "newer download").unwrap();
+        std::fs::write(&dest, "user edit").unwrap();
+        let err = finalize_download(&tmp, &dest, expected, 1).unwrap_err();
+        assert!(err.to_string().contains("changed since the plan"), "{err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "user edit");
+        assert!(!tmp.exists(), "temp file cleaned up");
+        // A brand-new file gets a sane default mode rather than the private temp mode.
+        let fresh = dir.join("fresh.txt");
+        let tmp2 = dir.join(".fresh.txt.dsync-part");
+        std::fs::write(&tmp2, "x").unwrap();
+        std::fs::set_permissions(&tmp2, std::fs::Permissions::from_mode(0o600)).unwrap();
+        finalize_download(&tmp2, &fresh, None, 1000).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn listing_lines_and_answers() {
         assert_eq!(fmt_size(Some(0)), "0 B");
         assert_eq!(fmt_size(Some(999)), "999 B");
         assert_eq!(fmt_size(Some(1234567)), "1,234,567 B");
@@ -1231,6 +1812,33 @@ mod tests {
             diff_line("y", Change::RemoteOnly, None, Some(&r)),
             "- y  remote only, 99 B"
         );
+        assert_eq!(
+            diff_line(
+                "Work",
+                Change::RemoteOnly,
+                None,
+                Some(&Entry {
+                    is_dir: true,
+                    ..Default::default()
+                })
+            ),
+            "- Work  remote only, folder"
+        );
+        assert_eq!(
+            diff_line("t", Change::TypeMismatch, Some(&l), Some(&r)),
+            "! t  folder on one side, file on the other"
+        );
+        assert_eq!(
+            line("+", "evil\x1b[31mname\n.txt", ""),
+            "+ evil\\u{1b}[31mname\\n.txt",
+            "control characters never reach the terminal"
+        );
+        assert!(parse_answer(Some("\n"), true));
+        assert!(!parse_answer(Some("\n"), false));
+        assert!(parse_answer(Some("Y\n"), false));
+        assert!(parse_answer(Some(" yes "), false));
+        assert!(!parse_answer(Some("n"), true));
+        assert!(!parse_answer(None, true), "EOF is never consent");
     }
 
     #[test]
@@ -1246,7 +1854,11 @@ mod tests {
             .collect();
         let up = |path: &str, existing: bool, mtime_ms: i64| Action::Upload {
             path: path.into(),
-            existing_id: existing.then(|| "i".to_string()),
+            existing: existing.then(|| Existing {
+                id: "i".into(),
+                mtime_ms: 0,
+                md5: None,
+            }),
             mtime_ms,
         };
         let down = |path: &str, mtime_ms: i64| Action::Download {
@@ -1254,6 +1866,7 @@ mod tests {
             id: "i".into(),
             mtime_ms,
             md5: None,
+            expected_local: None,
         };
         assert_eq!(
             action_line(&Action::Mkdir { path: "d/e".into() }, &local, &remote),
@@ -1293,10 +1906,9 @@ mod tests {
     }
 
     #[test]
-    fn local_walk_respects_ignore_depth_and_gd() {
-        let dir = std::env::temp_dir().join(format!("drive_rs_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for d in ["a/b/c", ".gd", "node_modules/x"] {
+    fn local_walk_scope_depth_and_exclusions() {
+        let dir = tmpdir("walk");
+        for d in ["a/b/c", ".gd", "nested/.gd", "node_modules/x", "empty"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
         for f in [
@@ -1305,6 +1917,8 @@ mod tests {
             "a/b/two.log",
             "a/b/c/three.txt",
             ".gd/config.json",
+            "nested/.gd/credentials.json",
+            "nested/ok.txt",
             "node_modules/x/y.js",
             ".part.dsync-part",
         ] {
@@ -1322,28 +1936,70 @@ mod tests {
                 "a/b/c",
                 "a/b/c/three.txt",
                 "a/one.txt",
+                "empty",
+                "nested",
+                "nested/ok.txt",
                 "top.txt"
-            ]
+            ],
+            "nested .gd, ignored, and temp files are excluded"
         );
         assert_eq!(all["top.txt"].size, Some(2));
         assert_eq!(all["a"].size, None);
+        // Depth is measured from the root on both sides: depth 1 from the root is top level only...
         let shallow = local_walk(&dir, &dir, 1, &ignore).unwrap();
         assert_eq!(
             shallow.keys().cloned().collect::<Vec<_>>(),
-            vec![".driveignore", "a", "top.txt"]
+            vec![".driveignore", "a", "empty", "nested", "top.txt"]
         );
+        // ...and a subtree at level 1 with depth 1 contributes only itself, never its children.
+        let sub = local_walk(&dir, &dir.join("a"), 1, &ignore).unwrap();
+        assert_eq!(sub.keys().cloned().collect::<Vec<_>>(), vec!["a"]);
+        let sub2 = local_walk(&dir, &dir.join("a"), 2, &ignore).unwrap();
+        assert_eq!(
+            sub2.keys().cloned().collect::<Vec<_>>(),
+            vec!["a", "a/b", "a/one.txt"]
+        );
+        assert!(
+            local_walk(&dir, &dir.join("a/b/c"), 2, &ignore).is_err(),
+            "selected path deeper than depth"
+        );
+        // The selected directory is part of its own snapshot, so an empty folder can be pushed.
+        let empty = local_walk(&dir, &dir.join("empty"), -1, &ignore).unwrap();
+        assert_eq!(empty.keys().cloned().collect::<Vec<_>>(), vec!["empty"]);
+        assert!(empty["empty"].is_dir);
         let single = local_walk(&dir, &dir.join("a/one.txt"), -1, &ignore).unwrap();
         assert_eq!(
             single.keys().cloned().collect::<Vec<_>>(),
             vec!["a/one.txt"]
         );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("a"), dir.join("alias")).unwrap();
+            assert!(
+                local_walk(&dir, &dir.join("alias"), -1, &ignore).is_err(),
+                "a symlinked selection is refused"
+            );
+            assert!(!local_walk(&dir, &dir, -1, &ignore)
+                .unwrap()
+                .contains_key("alias"));
+            if std::process::Command::new("mkfifo")
+                .arg(dir.join("pipe"))
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                let with_fifo = local_walk(&dir, &dir, -1, &ignore).unwrap();
+                assert!(
+                    !with_fifo.contains_key("pipe"),
+                    "non-regular files are never planned"
+                );
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn names_with_spaces_and_special_chars() {
-        let dir = std::env::temp_dir().join(format!("dsync_names_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tmpdir("names");
         let names = [
             "My Documents/Q3 report (final).txt",
             "My Documents/sub folder/it's 100%_done.md",
@@ -1374,9 +2030,12 @@ mod tests {
         let sub = local_walk(&dir, &dir.join("My Documents/sub folder"), -1, &ignore).unwrap();
         assert_eq!(
             sub.keys().cloned().collect::<Vec<_>>(),
-            vec!["My Documents/sub folder/it's 100%_done.md"]
+            vec![
+                "My Documents/sub folder",
+                "My Documents/sub folder/it's 100%_done.md"
+            ]
         );
-        let plan = plan_push(&local, &BTreeMap::new(), false);
+        let plan = plan_push(&local, &BTreeMap::new(), false, &none());
         assert!(plan.actions.contains(&Action::Mkdir {
             path: "My Documents/sub folder".into()
         }));
@@ -1396,6 +2055,12 @@ mod tests {
         assert!(!valid_name("."));
         assert!(!valid_name(".."));
         assert!(!valid_name(""));
+        assert!(is_reserved(".gd"));
+        assert!(is_reserved(".gd/config.json"));
+        assert!(is_reserved("x/.gd/y"));
+        assert!(is_reserved("x/.y.dsync-part"));
+        assert!(!is_reserved(".gdx/file"));
+        assert!(!is_reserved("normal/.hidden"));
     }
 
     #[test]
@@ -1407,6 +2072,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(absolutize("a b/../c d").unwrap(), cwd.join("c d"));
         assert_eq!(absolutize("/x y/./z").unwrap(), PathBuf::from("/x y/z"));
+        assert_eq!(ancestors("a/b/c").collect::<Vec<_>>(), vec!["a", "a/b"]);
+        assert_eq!(ancestors("top").count(), 0);
     }
 
     #[test]

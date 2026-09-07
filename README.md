@@ -16,9 +16,9 @@ Usage:
 
 ```
 dsync init [DIR] [--remote-folder PATH] [--depth N] [--credentials FILE | --client-id ID --client-secret SECRET]
-dsync push [PATH] [--force] [-y] [-j N] [--refresh] [--fast]
-dsync pull [PATH] [--force] [-y] [-j N] [--refresh] [--fast]
-dsync diff [PATH] [--refresh] [--fast] [-j N]
+dsync push [PATH] [--force] [-y] [-j N] [--refresh] [--fast | --verify]
+dsync pull [PATH] [--force] [-y] [-j N] [--refresh] [--fast | --verify]
+dsync diff [PATH] [--refresh] [--fast | --verify] [-j N]
 dsync status
 dsync update-cache [--refresh]
 dsync version
@@ -34,7 +34,7 @@ and may be a file or a directory; it defaults to the current directory.
 | `init [DIR]` | Turn `DIR` (default `.`) into a sync folder: authorize with Google in the browser, create or find the remote folder, write `DIR/.gd/` and a starter `.driveignore`. |
 | `push [PATH]` | Upload local files that are new or newer than their remote copy. Shows the plan and asks first. |
 | `pull [PATH]` | Download remote files that are new or newer than their local copy. Shows the plan and asks first. |
-| `diff [PATH]` | List files that differ between local and remote, with both modification times. Changes nothing. |
+| `diff [PATH]` | List files that differ between local and remote, with both modification times. Changes nothing. Exit status 1 when differences exist, like `diff(1)`. |
 | `status` | Show the local directory, remote folder, depth, cache state, ignore file and token expiry. |
 | `update-cache` | Refresh the local index of the remote tree only, so a later `diff` or `push` starts faster. |
 | `version` | Print the version. |
@@ -54,11 +54,12 @@ and may be a file or a directory; it defaults to the current directory.
 
 | Option | Meaning |
 |---|---|
-| `--force` | Also overwrite files listed as conflicts (destination newer, or same mtime with different content). Without it they are never touched. |
+| `--force` | Also overwrite files listed as conflicts because the destination is newer or has different content at the same mtime. Case collisions are never forced. Without it conflicts are never touched. |
 | `-y`, `--no-prompt` | Apply the plan without asking. Refuses to run if the plan contains conflicts. (push, pull) |
 | `-j N`, `--threads N` | Parallel transfer streams for push/pull, hashing threads for diff. Default 8, max 64. |
 | `--refresh` | Ignore the cached remote index and re-list the whole remote tree. Use if the index looks wrong. |
 | `--fast` | Use rsync's quick check instead of MD5 verification, see below. |
+| `--verify` | Re-read every file that needs hashing instead of trusting the local hash cache. Use after restoring files from a backup or when an editor preserves mtimes. |
 
 **`update-cache`**
 
@@ -70,8 +71,9 @@ and may be a file or a directory; it defaults to the current directory.
 
 By default every file present on both sides is verified by MD5: Drive supplies the remote MD5 for
 free, and the local MD5 is computed once and cached against the file's size and mtime, so after the
-first run only files whose stat changed are ever read. This catches every content difference, including
-a file that was edited with its mtime preserved.
+first run only files whose stat changed are ever read. Like git's index, the cache trusts a file whose
+size and mtime are unchanged; a file rewritten with its mtime deliberately restored is only noticed
+with `--verify`, which bypasses the cache.
 
 `--fast` switches to the quick check `rsync` uses without `-c`: a file whose **size and mtime match**
 on both sides is trusted as identical without being read, and only files with equal size but differing
@@ -188,14 +190,18 @@ dsync pull -y -j 16 # no prompt, 16 parallel streams
 | `.driveignore` | gitignore-syntax patterns to leave out of the sync (created with `.DS_Store`) |
 
 Every command may be run from any directory inside the sync root; `PATH` arguments are relative to
-the current directory and may name a file or a folder. `.gd/`, symlinks, `.driveignore` matches and
-leftover `.*.dsync-part` temp files are never synced.
+the current directory and may name a file or a folder (the folder itself is part of the comparison, so
+an empty folder can be pushed). The same exclusions apply to both sides: `.gd/` at any depth, symlinks,
+non-regular files (pipes, sockets, devices), `.driveignore` matches and leftover `.*.dsync-part` temp
+files are never scanned locally and never pulled from Drive. `depth` counts levels from the sync root
+on both sides.
 
 ### Authentication
 
-`init` runs the OAuth 2.0 installed-app flow: it listens on a random loopback port, opens the consent
-URL in the browser (with a random `state` nonce that the redirect must echo back), exchanges the code
-for tokens and stores them. From then on the access token is refreshed automatically whenever it is
+`init` runs the OAuth 2.0 installed-app flow with PKCE: it listens on a random loopback port, opens the
+consent URL in the browser (with a random `state` nonce that the redirect must echo back and an S256
+code challenge), exchanges the code for tokens and stores them. Nothing is written to `.gd/` until
+Google has accepted the authorization; state files are written atomically with mode `0600`. From then on the access token is refreshed automatically whenever it is
 within 60 s of expiry or the API answers 401. Worker threads share one token store, so concurrent
 401s trigger a single refresh. The Drive scope is `https://www.googleapis.com/auth/drive`, which is
 needed to see files that were not created by `dsync`.
@@ -213,6 +219,10 @@ Listing a Drive tree costs one request per folder, so `dsync` keeps an index of 
   listed once. If the incremental update fails the tool warns and falls back to a full listing.
 - **After every completed upload or folder creation** the worker records the result immediately, so
   a push interrupted with Ctrl-C is resumable on the next run without waiting for the Changes feed.
+  Folders whose contents still need listing are recorded in the database too, so a crash between two
+  steps of a refresh is finished by the next run rather than forgotten.
+- When Drive holds several items with one name in a folder the index keeps the first it saw; a
+  change to a duplicate never silently swaps the identity behind a path.
 - `dsync update-cache` refreshes the index without doing anything else.
 
 The database is opened in WAL mode with a busy timeout, so several instances can read and write it
@@ -235,7 +245,13 @@ every binary file. A pair is then compared, cheapest check first:
    is a **conflict**.
 
 `--fast` replaces steps 2 and 3 with rsync's quick check: equal size and equal mtime is trusted
-without reading the file, and only equal size with differing mtimes is hashed.
+without reading the file, and only equal size with differing mtimes is hashed. `--verify` ignores the
+hash cache and re-reads every file that needs hashing. A local file that cannot be read is reported
+as an error, never treated as identical, and makes the command exit non-zero.
+
+On a case-insensitive filesystem (the macOS and Windows defaults) names that differ only by case, and
+everything below such folders, are reported as conflicts and never transferred in either direction,
+because they would map onto one local file.
 
 Uploads set Drive's `modifiedTime` to the local mtime and downloads set the local mtime to Drive's
 `modifiedTime`, so both sides agree after a transfer and `dsync diff` reports nothing.
@@ -260,9 +276,15 @@ Proceed with the changes? [Y/n]:
 
 - **`+`** will be created on the destination, **`M`** will be overwritten because the source is newer
   (or `--force` was given), **`!`** is left alone for a structural reason (folder/file mismatch,
-  Google-native document), **`C`** is a conflict.
+  Google-native document), **`C`** is a conflict, **`E`** is a local file that could not be read.
 - **Conflicts** are never transferred. While any exist the prompt defaults to *no* and `--no-prompt`
-  refuses to run at all. Inspect with `dsync diff`, fix by hand, or re-run with `--force`.
+  refuses to run at all. Inspect with `dsync diff`, fix by hand, or re-run with `--force` (case
+  collisions cannot be forced). End of input at the prompt counts as *no*.
+- **Every write is re-validated at execution time.** Before a downloaded file replaces a local one,
+  the local file must still have exactly the size and mtime the plan saw (or still be absent); before
+  an update is uploaded, the Drive file must still have the MD5 and mtime the plan saw. Anything that
+  changed in between is reported as failed and left alone; re-run to re-plan. No write ever goes
+  through a symlink, into `.gd/`, or over a non-regular file.
 - **Nothing is ever deleted** on either side; a file removed locally stays on Drive and vice versa.
 - **Google-native documents** (Docs, Sheets, Slides, ...) have no binary content and are listed as
   skipped; a local file with the same name is never uploaded over one.
@@ -284,8 +306,12 @@ M docs/report.txt  local newer  local: 2026-09-08T10:00:00.000Z  remote: 2026-09
 - Files up to 5 MB are uploaded in one multipart request; larger files stream from disk through a
   resumable upload session, so memory use does not grow with file size. Drive commits a file only
   when the last byte arrives, so an interrupted upload leaves nothing behind.
-- Downloads stream to a `.name.dsync-part` temp file, are verified against Drive's MD5, and only then
-  renamed into place with the remote mtime applied.
+- Downloads stream to a freshly created `.name.dsync-part` temp file (mode `0600`, never through a
+  link), are verified against Drive's MD5, and only then renamed into place with the remote mtime
+  applied. An existing file keeps its permission bits; a new file gets `0644`.
+- Creates are not idempotent, so a create whose response was lost is reconciled by looking the name
+  up before trying again. A large upload that fails mid-way asks its resumable session how much
+  arrived and continues from there.
 - Rate-limit (403/429), server (5xx) and network errors are retried with exponential backoff and
   jitter. One failed file does not stop the others; the exit code is non-zero if any failed.
 - There is no overall request timeout, so multi-gigabyte transfers are fine; dead connections are
@@ -295,10 +321,17 @@ M docs/report.txt  local newer  local: 2026-09-08T10:00:00.000Z  remote: 2026-09
 
 Spaces, quotes, `%`, `_`, backslashes and Unicode in file and folder names are handled on both
 sides. Drive names that cannot exist locally (containing `/`, or `.`/`..`) and local names that are
-not valid UTF-8 are reported and skipped. When Drive holds several items with the same name in one
-folder, the first is used. Two machines syncing the same remote folder are not coordinated with each
-other, and on a case-insensitive filesystem two remote names differing only by case map to one
-local path.
+not valid UTF-8 are reported and skipped. Control characters in names are escaped before printing.
+
+### Known limitations
+
+- Two machines syncing the same remote folder are not coordinated with each other; the newer-side rule
+  and the execution-time checks limit the damage, but there is no three-way merge and no history.
+- Drive has no conditional update, so the pre-upload check narrows the window in which another editor
+  can change a remote file but cannot close it.
+- A full listing holds every My Drive entry in memory while the tree is assembled.
+- Unicode normalization differences (NFC vs NFD) are not detected as collisions.
+- Google-native documents are never downloaded; nothing is ever deleted on either side.
 
 ## Building
 
@@ -319,7 +352,8 @@ at build time; `dsync init` then works with no `--client-id`/`--client-secret`:
 DSYNC_CLIENT_ID=... DSYNC_CLIENT_SECRET=... cargo build --release
 ```
 
-Explicit flags, environment variables and `--credentials` still take precedence. Google treats
+Both variables must be set together; a partial pair is ignored. Explicit flags, environment variables
+and `--credentials` still take precedence. Google treats
 installed-app client secrets as non-confidential, but a bundled client shares one API quota and one
 consent-screen identity across everyone using that build, so keep such builds internal.
 
@@ -343,5 +377,7 @@ make linux-x86_64     # or: linux-arm64, macos-x86_64, macos-arm64
 | `macos-x86_64` | `x86_64-apple-darwin`        | cargo          |
 | `macos-arm64`  | `aarch64-apple-darwin`       | cargo          |
 
-The GitHub Actions workflow in `.github/workflows/release.yml` runs the tests and builds all four targets on
-every `v*` tag, attaching the binaries to a GitHub release.
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `clippy -D warnings`, the tests and a locked release
+build on Linux and macOS for every push and pull request, plus a RustSec advisory scan.
+`.github/workflows/release.yml` repeats the checks and builds all four targets on every `v*` tag,
+attaching the binaries and a `SHA256SUMS` file to a GitHub release.

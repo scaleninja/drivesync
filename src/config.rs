@@ -17,7 +17,7 @@ pub struct Config {
     /// Path of the remote folder under "My Drive" ("" = My Drive root).
     pub remote_folder: String,
     pub remote_folder_id: String,
-    /// Traversal depth; -1 = unlimited.
+    /// Traversal depth measured from the sync root on both sides; -1 = unlimited.
     pub depth: i32,
 }
 
@@ -63,19 +63,33 @@ pub fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Write `value` atomically and privately: a fresh 0600 temp file in the same directory is fsynced
+/// and renamed over `path`. A crash never leaves a truncated file, no reader ever sees a file with
+/// broader permissions, and a symlink at `path` is replaced rather than followed.
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(value)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let parent = path.parent().context("path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        // holds client secret / tokens
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // holds the client secret / tokens
     }
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut file = opts.open(&tmp)?;
+        std::io::Write::write_all(&mut file, serde_json::to_string_pretty(value)?.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -83,20 +97,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_json_is_private() {
+    fn save_json_is_private_atomic_and_replaces_symlinks() {
         let dir = std::env::temp_dir().join(format!("dsync_cfg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("credentials.json");
-        save_json(
-            &path,
-            &Credentials {
-                access_token: "a".into(),
-                refresh_token: "r".into(),
-                expires_at: 1,
-            },
-        )
-        .unwrap();
+        let creds = Credentials {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: 1,
+        };
+        save_json(&path, &creds).unwrap();
         let back: Credentials = load_json(&path).unwrap();
         assert_eq!(back.refresh_token, "r");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temp file left behind"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -104,6 +122,17 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            // A symlink at the target is replaced by a regular file; its target is untouched.
+            let outside = dir.join("outside.txt");
+            std::fs::write(&outside, "keep").unwrap();
+            let link = dir.join("linked.json");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            save_json(&link, &creds).unwrap();
+            assert!(!std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
