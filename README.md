@@ -18,8 +18,18 @@ dsync pull      # download remote changes
 
 ## Install
 
-Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the
-[releases page](https://github.com/scaleninja/drivesync/releases).
+**Homebrew** (macOS and Linux):
+
+```bash
+brew install scaleninja/tap/drivesync
+```
+
+This adds the [scaleninja/tap](https://github.com/scaleninja/homebrew-tap) tap, so other
+scaleninja tools then install with a plain `brew install <name>`. (If Homebrew refuses with an
+"untrusted tap" error, run `brew trust scaleninja/tap` first.)
+
+Or grab a prebuilt binary for Linux or macOS (x86_64 and arm64) from the
+[releases page](https://github.com/scaleninja/drivesync/releases):
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
