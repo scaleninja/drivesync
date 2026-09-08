@@ -46,7 +46,8 @@ Or from source with a Rust toolchain: `git clone https://github.com/scaleninja/d
 ## Setup
 
 `dsync` talks to Drive with an OAuth client that **you** create, so no credentials are baked into
-the binary. One-time steps in the [Google Cloud Console](https://console.cloud.google.com/):
+the binary. One-time steps in the [Google Cloud Console](https://console.cloud.google.com/)
+(there is a [step-by-step walkthrough with screenshots](docs/SETUP.md)):
 
 1. Create a project (or pick one).
 2. **APIs & Services → Library**: enable the *Google Drive API*.
