@@ -4,7 +4,9 @@ A small, fast command-line tool that keeps a local folder and a Google Drive fol
 Push local changes up, pull remote changes down, or just see what differs. Written in Rust,
 modelled on [odeke-em/drive](https://github.com/odeke-em/drive).
 
-- Home: <https://scaleninja.com/drivesync/> · Source: <https://github.com/scaleninja/drivesync> · License: [MIT](LICENSE)
+- Home: <https://scaleninja.com/drivesync/>
+- Source: <https://github.com/scaleninja/drivesync>
+- License: [MIT](LICENSE)
 
 ```
 dsync init ~/gdrive --remote-folder backups/lab --credentials ~/Downloads/client_secret.json
