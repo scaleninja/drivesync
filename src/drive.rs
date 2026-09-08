@@ -350,6 +350,28 @@ impl Drive {
         Ok(self.get_file(alias)?.id)
     }
 
+    /// Parent ids of `id` if it is still a live (not trashed, not deleted) folder; None otherwise.
+    pub fn live_folder_parents(&self, id: &str) -> Result<Option<Vec<String>>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Status {
+            mime_type: String,
+            #[serde(default)]
+            trashed: bool,
+            #[serde(default)]
+            parents: Vec<String>,
+        }
+        let url = format!("{API}/{id}");
+        let s: Status = match self
+            .send(&move |c| Ok(c.get(&url).query(&[("fields", "mimeType,trashed,parents")])))
+        {
+            Ok(r) => r.json()?,
+            Err(e) if is_status(&e, StatusCode::NOT_FOUND) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok((s.mime_type == FOLDER_MIME && !s.trashed).then_some(s.parents))
+    }
+
     /// Verify that the sync root is still a live folder: not deleted, not in the trash, not
     /// replaced by a file. Trashing a folder emits no change records for its children, so this
     /// is the only way to notice before writing into (or reading out of) the trash.

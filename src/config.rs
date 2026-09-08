@@ -40,9 +40,19 @@ impl Workspace {
     pub fn find() -> Result<Self> {
         let mut dir = std::env::current_dir()?;
         loop {
-            if dir.join(GD_DIR).is_dir() {
-                let config = load_json(&dir.join(GD_DIR).join("config.json"))?;
-                return Ok(Self { root: dir, config });
+            // Only a real directory counts: a symlinked `.gd` could redirect credentials, the
+            // cache and the lock outside the workspace.
+            if let Ok(m) = std::fs::symlink_metadata(dir.join(GD_DIR)) {
+                if m.file_type().is_symlink() {
+                    bail!(
+                        "{} is a symlink; dsync state must be a real directory",
+                        dir.join(GD_DIR).display()
+                    );
+                }
+                if m.is_dir() {
+                    let config = load_json(&dir.join(GD_DIR).join("config.json"))?;
+                    return Ok(Self { root: dir, config });
+                }
             }
             if !dir.pop() {
                 bail!("not inside a dsync workspace (no .gd directory found); run `dsync init`");

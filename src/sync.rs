@@ -1090,24 +1090,37 @@ impl crate::drive::SessionStore for Sessions<'_> {
             .flatten()
     }
     fn save(&self, path: &str, uri: &str) {
-        let _ = self
+        if let Err(e) = self
             .cache
-            .set_upload_session(path, self.size, self.mtime_ms, uri);
+            .set_upload_session(path, self.size, self.mtime_ms, uri)
+        {
+            progress::eprintln(&format!(
+                "warning: could not record the upload session for {} ({e:#}); an interrupted upload will restart from zero",
+                display(path)
+            ));
+        }
     }
     fn clear(&self, path: &str) {
-        let _ = self.cache.clear_upload_session(path);
+        if let Err(e) = self.cache.clear_upload_session(path) {
+            progress::eprintln(&format!(
+                "warning: could not clear the upload session for {}: {e:#}",
+                display(path)
+            ));
+        }
     }
 }
 
 /// Execute a push plan. Folders are created level by level, each level in parallel; then file
 /// uploads run in parallel. Every completed action is recorded in the cache immediately, so a
 /// cancelled push resumes cleanly. `base_rel` is the pushed subtree's root ("" for the workspace
-/// root), which the caller has already made sure exists on Drive as `base_id`. Returns the
-/// number of failures.
+/// root), which the caller has already made sure exists on Drive as `base_id`; `root_id` is the
+/// sync root's id. Returns the number of failures.
+#[allow(clippy::too_many_arguments)]
 pub fn exec_push(
     drive: &Drive,
     cache: &Cache,
     root: &Path,
+    root_id: &str,
     base_rel: &str,
     base_id: &str,
     actions: Vec<Action>,
@@ -1121,6 +1134,70 @@ pub fn exec_push(
         .collect();
     folder_ids.insert(base_rel.to_string(), base_id.to_string());
     let mut failures = 0;
+
+    // Phase 0: every already-indexed folder the plan writes into, and each of its ancestors, must
+    // still hang where the index says it does. A folder moved out of the sync tree (or trashed)
+    // since the refresh would otherwise receive new content at its new location. The ids come
+    // from the index, so its ancestors' ids are looked up there too.
+    let id_of = |p: &str| -> Option<String> {
+        folder_ids.get(p).cloned().or_else(|| {
+            cache
+                .entry(p)
+                .ok()
+                .flatten()
+                .filter(|e| e.is_dir)
+                .and_then(|e| e.id)
+        })
+    };
+    let written_into = actions.iter().filter_map(|a| match a {
+        Action::Mkdir { path } if path == base_rel => None,
+        Action::Mkdir { path } | Action::Upload { path, .. } => Some(parent_of(path)),
+        Action::Download { .. } => None,
+    });
+    let to_verify = folders_to_verify(written_into, &|p| id_of(p).is_some());
+    let checks: Vec<(String, String, String)> = to_verify
+        .iter()
+        .filter_map(|p| {
+            let expected = if parent_of(p).is_empty() {
+                root_id.to_string()
+            } else {
+                id_of(parent_of(p))?
+            };
+            Some((p.clone(), id_of(p)?, expected))
+        })
+        .collect();
+    let mut bad: BTreeSet<String> = BTreeSet::new();
+    for (path, ok) in parallel(checks, threads, |(path, id, expected)| {
+        let ok = match drive.live_folder_parents(&id) {
+            Ok(Some(parents)) => parents.contains(&expected),
+            Ok(None) => false,
+            Err(e) => {
+                progress::eprintln(&format!(
+                    "x failed   {}/: could not verify the folder on Drive: {e:#}",
+                    display(&path)
+                ));
+                false
+            }
+        };
+        if !ok {
+            progress::eprintln(&format!(
+                "x failed   {}/: folder was moved, trashed or deleted on Drive since the plan was made; re-run",
+                display(&path)
+            ));
+        }
+        (path, ok)
+    }) {
+        if !ok {
+            bad.insert(path);
+        }
+    }
+    if !bad.is_empty() {
+        // Nothing is written into a bad folder or anything below it.
+        folder_ids.retain(|p, _| {
+            !bad.iter()
+                .any(|b| p == b || p.starts_with(&format!("{b}/")))
+        });
+    }
 
     // Phase 1: folders, grouped by depth. Every folder at one level has its parent from the level above.
     let mut levels: BTreeMap<usize, Vec<String>> = BTreeMap::new();
@@ -1157,7 +1234,7 @@ pub fn exec_push(
                     Some(parent_id) => batch.push((path, parent_id.clone())),
                     None => {
                         progress::eprintln(&format!(
-                            "x failed   {}/: parent folder was not created",
+                            "x failed   {}/: parent folder is not available on Drive",
                             display(&path)
                         ));
                         failures += 1;
@@ -1206,7 +1283,7 @@ pub fn exec_push(
             Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms, md5)),
             None => {
                 progress::eprintln(&format!(
-                    "x failed   {}: parent folder was not created",
+                    "x failed   {}: parent folder is not available on Drive",
                     display(&path)
                 ));
                 failures += 1;
@@ -1264,10 +1341,15 @@ pub fn exec_push(
                 if after.len() != size || mtime_ms_of(&after) != mtime_ms {
                     bail!("file changed during the upload; re-run to push its current content");
                 }
-                if let Some(remote) = &f.md5_checksum {
-                    if *remote != md5 {
-                        bail!("checksum mismatch after upload (local {md5}, Drive {remote}); re-run to push it again");
+                match &f.md5_checksum {
+                    Some(remote) if *remote != md5 => {
+                        bail!("checksum mismatch after upload (local {md5}, Drive {remote}); re-run to push it again")
                     }
+                    Some(_) => {}
+                    None => progress::eprintln(&format!(
+                        "warning: {} was uploaded but Drive returned no checksum, so it could not be verified",
+                        display(&path)
+                    )),
                 }
                 if let Err(e) = cache.upsert(&path, &f.to_entry()) {
                     progress::eprintln(&format!(
@@ -1300,6 +1382,22 @@ pub fn exec_push(
     );
     spinner.finish();
     Ok(failures + results.into_iter().filter(|failed| *failed).count())
+}
+
+/// The already-indexed folders (and all their ancestors, up to but excluding the root) that a
+/// set of destination parents refers to. `known` says whether a path is an indexed folder.
+fn folders_to_verify<'a>(
+    parents: impl Iterator<Item = &'a str>,
+    known: &dyn Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for parent in parents {
+        let mut p = parent;
+        while !p.is_empty() && known(p) && out.insert(p.to_string()) {
+            p = parent_of(p);
+        }
+    }
+    out
 }
 
 /// Execute a pull plan: local folders first, then downloads in parallel. Every write goes through
@@ -2311,6 +2409,19 @@ mod tests {
     fn rfc3339_roundtrip() {
         let ms = parse_rfc3339_ms("2026-09-08T10:20:30.123Z").unwrap();
         assert_eq!(fmt_ms(ms), "2026-09-08T10:20:30.123Z");
+    }
+
+    #[test]
+    fn folders_to_verify_covers_ancestors_once_and_never_the_root() {
+        let known = |p: &str| ["a", "a/b", "a/b/c", "x"].contains(&p);
+        let parents = ["a/b/c", "a/b", "x", "", "a/new"];
+        let out = folders_to_verify(parents.into_iter(), &known);
+        assert_eq!(
+            out.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a", "a/b", "a/b/c", "x"]
+        );
+        // An unindexed parent ("a/new") contributes nothing; the root never appears.
+        assert!(!out.contains("") && !out.contains("a/new"));
     }
 
     #[test]

@@ -224,6 +224,12 @@ fn init(
     // Nothing on disk changes until Google has accepted the authorization.
     let http = http();
     let creds = auth::Auth::login(&http, &config)?;
+    if std::fs::symlink_metadata(root.join(GD_DIR)).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "{} is a symlink; dsync state must be a real directory",
+            root.join(GD_DIR).display()
+        );
+    }
     std::fs::create_dir_all(root.join(GD_DIR))?;
     let ws = Workspace {
         root: root.clone(),
@@ -432,6 +438,7 @@ fn push(o: &SyncOpts) -> Result<()> {
         &drive,
         &cache,
         &ws.root,
+        &ws.config.remote_folder_id,
         &base_rel,
         &base_id,
         plan.actions,

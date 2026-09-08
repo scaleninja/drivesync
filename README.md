@@ -127,7 +127,8 @@ Proceed with the changes? [Y/n]:
   prompt defaults to *no*, `--no-prompt` refuses to run, and end-of-input is never taken as *yes*.
 - **Write stale data.** Every destination is re-checked right before it is written: a local file must
   still have the size and mtime the plan saw; a Drive file must still have the MD5, mtime, name and
-  parent folder the plan saw, and a file to be created must still be absent. Anything that changed
+  parent folder the plan saw, a file to be created must still be absent, and every folder new
+  content goes into must still sit where the index placed it inside the sync tree. Anything that changed
   in between is reported and left alone. A local file that changes while it is being read or
   uploaded is reported as an error, and every upload is verified against the MD5 Drive computed.
 - **Escape the sync folder.** Nothing is written through a symlink, into `.gd/`, over an ignored
