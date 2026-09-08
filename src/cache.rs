@@ -8,7 +8,7 @@
 //! The connection sits behind a mutex so worker threads can record each completed upload or folder
 //! creation immediately, which keeps a cancelled push resumable even if the Changes feed lags.
 //! Subtree queries compare exact path prefixes (never `LIKE`), so they are case-sensitive.
-use crate::drive::Drive;
+use crate::drive::{Change, Drive};
 use crate::sync::{join_rel, Entry};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -28,9 +28,24 @@ pub struct Cache {
 
 impl Cache {
     /// Open (or create) the cache. WAL mode plus a busy timeout lets several CLI instances share it.
+    /// The file is created privately (0600): it holds the names of everything on the remote side.
     pub fn open(path: &Path) -> Result<Self> {
+        if path.to_str() != Some(":memory:") && !path.exists() {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            }
+        }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(15))?;
+        conn.busy_timeout(std::time::Duration::from_secs(60))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -42,8 +57,11 @@ impl Cache {
              CREATE TABLE IF NOT EXISTS local_hashes (
                  path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ms INTEGER NOT NULL, md5 TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS pending_walks (
-                 id TEXT PRIMARY KEY, path TEXT NOT NULL, depth INTEGER NOT NULL);",
-        )?;
+                 id TEXT PRIMARY KEY, path TEXT NOT NULL, depth INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS upload_sessions (
+                 path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ms INTEGER NOT NULL, uri TEXT NOT NULL);",
+        )
+        .with_context(|| format!("initializing {}", path.display()))?;
         // Databases created before the size column existed.
         let has_size = conn
             .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'size'")?
@@ -54,6 +72,28 @@ impl Cache {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Open the cache, rebuilding it from scratch if the file is damaged. The cache is only an
+    /// index of the remote side and of local hashes, so losing it costs one full listing. Only
+    /// call this while holding the exclusive workspace lock.
+    pub fn open_or_rebuild(path: &Path) -> Result<Self> {
+        match Self::open(path) {
+            Ok(c) => Ok(c),
+            Err(e) if is_corruption(&e) => {
+                crate::progress::eprintln(&format!(
+                    "warning: {} is damaged ({e:#}); rebuilding it",
+                    path.display()
+                ));
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut p = path.as_os_str().to_owned();
+                    p.push(suffix);
+                    let _ = std::fs::remove_file(p);
+                }
+                Self::open(path)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -105,6 +145,28 @@ impl Cache {
         id_at(&self.conn(), path)
     }
 
+    /// The indexed entry at exactly `path`, if any.
+    pub fn entry(&self, path: &str) -> Result<Option<Entry>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, mtime_ms, md5, is_dir, native_doc, size FROM files WHERE path = ?1",
+                [path],
+                |r| {
+                    Ok(Entry {
+                        id: Some(r.get(0)?),
+                        mtime_ms: r.get(1)?,
+                        md5: r.get(2)?,
+                        is_dir: r.get(3)?,
+                        native_doc: r.get(4)?,
+                        size: r.get::<_, Option<i64>>(5)?.map(|n| n as u64),
+                        unreadable: false,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Cached MD5 of a local file, valid only if its size and mtime are unchanged.
     pub fn local_hash(&self, path: &str, size: u64, mtime_ms: i64) -> Result<Option<String>> {
         Ok(self
@@ -123,6 +185,39 @@ impl Cache {
              ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ms = excluded.mtime_ms, md5 = excluded.md5",
             params![path, size, mtime_ms, md5],
         )?;
+        Ok(())
+    }
+
+    /// The resumable-upload session recorded for a local file, valid only while its stat is unchanged.
+    pub fn upload_session(&self, path: &str, size: u64, mtime_ms: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT uri FROM upload_sessions WHERE path = ?1 AND size = ?2 AND mtime_ms = ?3",
+                params![path, size, mtime_ms],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_upload_session(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ms: i64,
+        uri: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO upload_sessions(path, size, mtime_ms, uri) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ms = excluded.mtime_ms, uri = excluded.uri",
+            params![path, size, mtime_ms, uri],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_upload_session(&self, path: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM upload_sessions WHERE path = ?1", [path])?;
         Ok(())
     }
 
@@ -278,6 +373,7 @@ fn touch(conn: &Connection, token: &str, depth: i32) -> Result<()> {
 
 /// Bring the cache up to date: incrementally via the Changes API when possible, otherwise a full listing.
 pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bool) -> Result<()> {
+    drive.check_folder(root_id)?;
     let same_depth = cache.meta(DEPTH_KEY)?.as_deref() == Some(&depth.to_string());
     if let (false, true, Some(token)) = (full, same_depth, cache.meta(TOKEN_KEY)?) {
         let incremental = drain_pending(drive, cache)
@@ -322,62 +418,7 @@ fn apply_changes(
         let conn = cache.conn();
         let tx = conn.unchecked_transaction()?;
         for ch in changes {
-            let old_path = path_of_id(&tx, &ch.file_id)?;
-            let drop_old = |conn: &Connection| -> Result<()> {
-                old_path.as_deref().map_or(Ok(()), |p| remove(conn, p))
-            };
-            let Some(f) = ch.file.filter(|f| !ch.removed && !f.trashed) else {
-                drop_old(&tx)?;
-                continue;
-            };
-            // Locate the parent inside our tree; anything else has moved out of (or was never in) scope.
-            let parent_path = match f.parents.first() {
-                Some(p) if p == root_id => Some(String::new()),
-                Some(p) => path_of_id(&tx, p)?,
-                None => None,
-            };
-            let Some(parent_path) = parent_path else {
-                drop_old(&tx)?;
-                continue;
-            };
-            if !crate::sync::valid_name(&f.file.name) {
-                crate::progress::eprintln(&format!(
-                    "! skip     remote name {:?} cannot be a local path",
-                    f.file.name
-                ));
-                drop_old(&tx)?;
-                continue;
-            }
-            let new_path = join_rel(&parent_path, &f.file.name);
-            let level = new_path.matches('/').count() as i32 + 1;
-            if depth >= 0 && level > depth {
-                drop_old(&tx)?;
-                continue;
-            }
-            // Drive allows several items with one name in a folder; the index keeps the first one it
-            // saw, so a change to a duplicate never silently swaps the identity behind a path.
-            if old_path.is_none()
-                && id_at(&tx, &new_path)?.is_some_and(|existing| existing != f.file.id)
-            {
-                continue;
-            }
-            let moved = old_path.as_deref().is_some_and(|old| old != new_path);
-            if let Some(old) = old_path.as_deref().filter(|_| moved) {
-                rename(&tx, old, &new_path)?;
-            }
-            let entry = f.file.to_entry();
-            upsert(&tx, &new_path, &entry)?;
-            if entry.is_dir {
-                let remaining = if depth < 0 { -1 } else { depth - level };
-                if old_path.is_none() {
-                    add_pending(&tx, &f.file.id, &new_path, remaining)?;
-                } else if moved && depth >= 0 {
-                    // A folder moved to another level: children beyond the limit go, children that
-                    // were beyond it before must be fetched.
-                    prune_deeper(&tx, &new_path, depth)?;
-                    add_pending(&tx, &f.file.id, &new_path, remaining)?;
-                }
-            }
+            apply_change(&tx, ch, root_id, depth)?;
         }
         tx.commit()?;
     }
@@ -387,6 +428,91 @@ fn apply_changes(
     drain_pending(drive, cache)?;
     let conn = cache.conn();
     touch(&conn, &new_token, depth)
+}
+
+/// Apply one record from the Changes feed to the index (no network).
+///
+/// Rules: a removed, trashed or out-of-scope file leaves the index together with its subtree; a
+/// file is located through whichever of its parents is inside the tree; the first entry seen at a
+/// path keeps it, so neither a new duplicate nor a rename onto an occupied path can swap the
+/// identity behind a path; a newly visible folder is queued for listing.
+fn apply_change(tx: &Connection, ch: Change, root_id: &str, depth: i32) -> Result<()> {
+    let Some(file_id) = ch.file_id.as_deref() else {
+        return Ok(()); // a change to a shared drive, not to a file
+    };
+    let old_path = path_of_id(tx, file_id)?;
+    let drop_old = |conn: &Connection| -> Result<()> {
+        old_path.as_deref().map_or(Ok(()), |p| remove(conn, p))
+    };
+    let Some(f) = ch.file.filter(|f| !ch.removed && !f.trashed) else {
+        return drop_old(tx);
+    };
+    // Locate a parent inside our tree; a file with none has moved out of (or was never in) scope.
+    let mut parent_path = None;
+    for p in &f.parents {
+        parent_path = if p == root_id {
+            Some(String::new())
+        } else {
+            path_of_id(tx, p)?
+        };
+        if parent_path.is_some() {
+            break;
+        }
+    }
+    let Some(parent_path) = parent_path else {
+        return drop_old(tx);
+    };
+    if !crate::sync::valid_name(&f.file.name) {
+        crate::progress::eprintln(&format!(
+            "! skip     remote name {:?} cannot be a local path",
+            f.file.name
+        ));
+        return drop_old(tx);
+    }
+    let new_path = join_rel(&parent_path, &f.file.name);
+    let level = new_path.matches('/').count() as i32 + 1;
+    if depth >= 0 && level > depth {
+        return drop_old(tx);
+    }
+    let moved = old_path.as_deref().is_some_and(|old| old != new_path);
+    if (old_path.is_none() || moved)
+        && id_at(tx, &new_path)?.is_some_and(|existing| existing != f.file.id)
+    {
+        // Another entry already owns this path; the newcomer is not indexed (and if it was
+        // indexed elsewhere, it leaves, since it no longer lives there).
+        return drop_old(tx);
+    }
+    if let Some(old) = old_path.as_deref().filter(|_| moved) {
+        rename(tx, old, &new_path)?;
+    }
+    let entry = f.file.to_entry();
+    upsert(tx, &new_path, &entry)?;
+    if entry.is_dir {
+        let remaining = if depth < 0 { -1 } else { depth - level };
+        if old_path.is_none() {
+            add_pending(tx, &f.file.id, &new_path, remaining)?;
+        } else if moved && depth >= 0 {
+            // A folder moved to another level: children beyond the limit go, children that
+            // were beyond it before must be fetched.
+            prune_deeper(tx, &new_path, depth)?;
+            add_pending(tx, &f.file.id, &new_path, remaining)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether an open/init error means the database file itself is unusable.
+fn is_corruption(e: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode::*;
+    e.chain().any(|c| {
+        c.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(f, _)
+                    if matches!(f.code, NotADatabase | DatabaseCorrupt)
+            )
+        })
+    })
 }
 
 #[cfg(test)]
@@ -596,6 +722,164 @@ mod tests {
             Some("h"),
             "prefix is case-sensitive"
         );
+    }
+
+    fn change(id: &str, name: &str, parents: &[&str], folder: bool, trashed: bool) -> Change {
+        use crate::drive::{ChangedFile, File, FOLDER_MIME};
+        Change {
+            file_id: Some(id.into()),
+            removed: false,
+            file: Some(ChangedFile {
+                file: File {
+                    id: id.into(),
+                    name: name.into(),
+                    mime_type: if folder {
+                        FOLDER_MIME.into()
+                    } else {
+                        "text/plain".into()
+                    },
+                    modified_time: Some("2026-09-08T00:00:00.000Z".into()),
+                    md5_checksum: (!folder).then(|| "m".into()),
+                    size: (!folder).then(|| "1".into()),
+                },
+                parents: parents.iter().map(|p| p.to_string()).collect(),
+                trashed,
+            }),
+        }
+    }
+
+    #[test]
+    fn changes_keep_first_owner_and_locate_by_any_parent_in_tree() {
+        let c = Cache::open(Path::new(":memory:")).unwrap();
+        for (p, id, d) in [
+            ("a", "A", true),
+            ("a/x.txt", "X", false),
+            ("b", "B", true),
+            ("b/y.txt", "Y", false),
+        ] {
+            c.upsert(p, &e(id, d)).unwrap();
+        }
+        let conn = c.conn();
+        // A record without a file id (a shared-drive change) is ignored.
+        let none = Change {
+            file_id: None,
+            removed: false,
+            file: None,
+        };
+        apply_change(&conn, none, "ROOT", -1).unwrap();
+        // Legacy multi-parent file: the parent inside the tree is the one that counts.
+        apply_change(
+            &conn,
+            change("Z", "z.txt", &["OUTSIDE", "B"], false, false),
+            "ROOT",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(path_of_id(&conn, "Z").unwrap().as_deref(), Some("b/z.txt"));
+        // Y moved and renamed onto a/x.txt, which X already owns: X keeps the path, Y leaves.
+        apply_change(
+            &conn,
+            change("Y", "x.txt", &["A"], false, false),
+            "ROOT",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(id_at(&conn, "a/x.txt").unwrap().as_deref(), Some("X"));
+        assert_eq!(path_of_id(&conn, "Y").unwrap(), None);
+        // A brand-new duplicate of an indexed name is not indexed either.
+        apply_change(
+            &conn,
+            change("X2", "x.txt", &["A"], false, false),
+            "ROOT",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(id_at(&conn, "a/x.txt").unwrap().as_deref(), Some("X"));
+        // Content change in place keeps the identity and updates the metadata.
+        apply_change(
+            &conn,
+            change("X", "x.txt", &["A"], false, false),
+            "ROOT",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(id_at(&conn, "a/x.txt").unwrap().as_deref(), Some("X"));
+        // A file moved out of the tree, and a trashed folder, leave with their subtrees.
+        apply_change(
+            &conn,
+            change("Z", "z.txt", &["OUTSIDE"], false, false),
+            "ROOT",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(path_of_id(&conn, "Z").unwrap(), None);
+        apply_change(&conn, change("A", "a", &["ROOT"], true, true), "ROOT", -1).unwrap();
+        assert_eq!(path_of_id(&conn, "X").unwrap(), None);
+        assert_eq!(path_of_id(&conn, "A").unwrap(), None);
+        // A newly visible folder is queued for listing with the remaining depth; one beyond the
+        // depth limit is ignored.
+        apply_change(&conn, change("N", "n", &["ROOT"], true, false), "ROOT", 2).unwrap();
+        apply_change(
+            &conn,
+            change("DEEP", "deep", &["N"], true, false),
+            "ROOT",
+            2,
+        )
+        .unwrap();
+        apply_change(
+            &conn,
+            change("TOODEEP", "f.txt", &["DEEP"], false, false),
+            "ROOT",
+            2,
+        )
+        .unwrap();
+        assert_eq!(id_at(&conn, "n/deep").unwrap().as_deref(), Some("DEEP"));
+        assert_eq!(id_at(&conn, "n/deep/f.txt").unwrap(), None);
+        drop(conn);
+        assert_eq!(
+            c.pending_walks().unwrap(),
+            vec![
+                ("N".into(), "n".into(), 1),
+                ("DEEP".into(), "n/deep".into(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn damaged_cache_is_rebuilt_and_sessions_and_entries_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dsync_rebuild_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.db");
+        std::fs::write(&path, b"this is not a database").unwrap();
+        assert!(Cache::open(&path).is_err());
+        let c = Cache::open_or_rebuild(&path).unwrap();
+        assert_eq!(c.count().unwrap(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        c.upsert("d", &e("D", true)).unwrap();
+        c.upsert("d/f", &e("F", false)).unwrap();
+        assert!(c.entry("d").unwrap().unwrap().is_dir);
+        assert_eq!(c.entry("d/f").unwrap().unwrap().id.as_deref(), Some("F"));
+        assert!(c.entry("nope").unwrap().is_none());
+        // Sessions are valid only for the exact stat they were recorded under.
+        c.set_upload_session("big.bin", 10, 20, "https://session")
+            .unwrap();
+        assert_eq!(
+            c.upload_session("big.bin", 10, 20).unwrap().as_deref(),
+            Some("https://session")
+        );
+        assert_eq!(c.upload_session("big.bin", 11, 20).unwrap(), None);
+        c.clear_upload_session("big.bin").unwrap();
+        assert_eq!(c.upload_session("big.bin", 10, 20).unwrap(), None);
+        drop(c);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

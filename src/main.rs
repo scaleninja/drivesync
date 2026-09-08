@@ -114,11 +114,12 @@ enum Cmd {
 
 fn main() {
     // Every command returns before the process exits, so locks and the cache close cleanly.
+    // Exit status: 0 success, 1 `diff` found differences, 2 an error or a failed transfer.
     let code = match run() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
-            1
+            2
         }
     };
     std::process::exit(code);
@@ -165,12 +166,13 @@ fn run() -> Result<i32> {
 }
 
 fn http() -> reqwest::blocking::Client {
-    // No overall timeout: a multi-gigabyte upload or download may legitimately take hours.
-    // Dead connections are still detected via the connect timeout and TCP keepalive.
+    // The default timeout bounds each metadata request and, for downloads, each read of the body,
+    // so a stalled connection fails and is retried instead of hanging forever. Requests that carry
+    // a large body set their own budget (see `drive::transfer_timeout`).
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .timeout(None)
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("http client")
 }
@@ -194,7 +196,12 @@ fn init(
     let (client_id, client_secret) = match (credentials, client_id, client_secret) {
         (Some(file), _, _) => {
             let v: serde_json::Value = load_json(Path::new(&file))?;
-            let app = v.get("installed").or_else(|| v.get("web")).context("client_secret.json has no 'installed' or 'web' section")?;
+            if v.get("installed").is_none() && v.get("web").is_some() {
+                // A "Web application" client only accepts pre-registered redirect URIs, and the
+                // loopback port here is chosen at run time, so Google would reject the redirect.
+                bail!("{file} is a 'Web application' OAuth client; create one of type 'Desktop app' instead");
+            }
+            let app = v.get("installed").context("client_secret.json has no 'installed' section")?;
             let get = |k: &str| app.get(k).and_then(|x| x.as_str()).map(String::from).with_context(|| format!("client_secret.json missing {k}"));
             (get("client_id")?, get("client_secret")?)
         }
@@ -241,7 +248,7 @@ fn init(
     if !root.join(config::IGNORE_FILE).exists() {
         std::fs::write(
             root.join(config::IGNORE_FILE),
-            "# gitignore-style patterns for files dsync should not sync\n.DS_Store\n",
+            "# gitignore-style patterns for files dsync should not sync\n.DS_Store\n._*\n",
         )?;
     }
     println!(
@@ -269,9 +276,19 @@ fn open(ws: &mut Workspace) -> Result<Drive> {
     Ok(drive)
 }
 
-/// Resolve a user-supplied relative path to (absolute local path, workspace-relative path).
+/// Resolve a user-supplied path to (absolute local path, workspace-relative path). The path is
+/// taken in its on-disk spelling (see `real_path`), so on a case-insensitive filesystem
+/// `push Docs` means the folder stored as `docs` and lines up with the remote index rather than
+/// planning a second copy of everything under a differently-cased name.
 fn target(ws: &Workspace, path: &str) -> Result<(std::path::PathBuf, String)> {
-    let abs = sync::absolutize(path)?;
+    let typed = sync::absolutize(path)?;
+    if std::fs::symlink_metadata(&typed).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "{} is a symlink; dsync does not follow symlinks",
+            typed.display()
+        );
+    }
+    let abs = real_path(&typed);
     let rel = sync::rel_path(&ws.root, &abs)?;
     if sync::is_reserved(&rel) {
         bail!("{rel} is reserved for dsync's own state");
@@ -279,8 +296,30 @@ fn target(ws: &Workspace, path: &str) -> Result<(std::path::PathBuf, String)> {
     Ok((abs, rel))
 }
 
-/// The workspace lock: push, pull and init hold it exclusively; diff and update-cache hold it
-/// shared, so readers never overlap a writer but may overlap each other.
+/// The on-disk form of `abs`: symlinked prefixes are resolved (`/tmp` is `/private/tmp` on macOS,
+/// and the workspace root, found via `getcwd`, is always in resolved form) and existing components
+/// take the case and Unicode normalization the filesystem stored them under. Components that do
+/// not exist yet are kept as typed.
+fn real_path(abs: &Path) -> std::path::PathBuf {
+    let mut existing = abs.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(n) => missing.push(n.to_os_string()),
+            None => return abs.to_path_buf(),
+        }
+        existing.pop();
+    }
+    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for n in missing.into_iter().rev() {
+        out.push(n);
+    }
+    out
+}
+
+/// The workspace lock. Every command that touches the cache (push, pull, diff, update-cache,
+/// init) holds it exclusively: even `diff` writes the index and the hash cache, so two instances
+/// never interleave their updates. `status` only reads and takes no lock.
 fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -370,7 +409,7 @@ fn push(o: &SyncOpts) -> Result<()> {
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
-    let cache = Cache::open(&ws.gd("cache.db"))?;
+    let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, &o.path)?;
     if !abs.exists() {
         bail!("{} does not exist", abs.display());
@@ -380,35 +419,14 @@ fn push(o: &SyncOpts) -> Result<()> {
     if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
         return finish("push", 0, plan.errors.len());
     }
-    // Folder that will hold the pushed subtree; created on demand and recorded in the cache.
+    // Folder that will hold the pushed subtree; created on demand (every level recorded in the
+    // cache) so the executor can hang the subtree off it.
     let base_rel = if abs.is_file() {
         sync::parent_of(&rel).to_string()
     } else {
         rel.clone()
     };
-    let known = snap
-        .remote
-        .get(&base_rel)
-        .or(cache.load(&base_rel)?.get(&base_rel))
-        .and_then(|e| e.id.clone());
-    let base_id = match known {
-        Some(id) => id,
-        None if base_rel.is_empty() => ws.config.remote_folder_id.clone(),
-        None => {
-            let id = drive
-                .resolve_folder(&ws.config.remote_folder_id, &base_rel, true)?
-                .context("creating remote folder")?;
-            cache.upsert(
-                &base_rel,
-                &sync::Entry {
-                    is_dir: true,
-                    id: Some(id.clone()),
-                    ..Default::default()
-                },
-            )?;
-            id
-        }
-    };
+    let base_id = ensure_remote_folder(&drive, &cache, &ws, &base_rel)?;
     let total = plan.actions.len();
     let failures = sync::exec_push(
         &drive,
@@ -427,8 +445,12 @@ fn pull(o: &SyncOpts) -> Result<()> {
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
-    let cache = Cache::open(&ws.gd("cache.db"))?;
+    let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, &o.path)?;
+    let stale = sync::remove_stale_parts(&ws.root, &abs);
+    if stale > 0 {
+        eprintln!("removed {stale} temp file(s) left by an interrupted download");
+    }
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
     if snap.remote.is_empty() && !rel.is_empty() {
         bail!(
@@ -443,6 +465,26 @@ fn pull(o: &SyncOpts) -> Result<()> {
     let total = plan.actions.len();
     let failures = sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?;
     finish("pull", total, failures + plan.errors.len())
+}
+
+/// Make sure the folder at workspace path `rel` ("" = the sync root) exists on Drive, creating
+/// any missing level and recording each one in the index. Drive is consulted for every level
+/// the index does not know, so a folder created elsewhere is adopted rather than duplicated.
+fn ensure_remote_folder(drive: &Drive, cache: &Cache, ws: &Workspace, rel: &str) -> Result<String> {
+    let mut id = ws.config.remote_folder_id.clone();
+    let mut path = String::new();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        path = sync::join_rel(&path, part);
+        id = match cache.entry(&path)?.filter(|e| e.is_dir).and_then(|e| e.id) {
+            Some(id) => id,
+            None => {
+                let f = drive.find_or_create_folder(&id, part)?;
+                cache.upsert(&path, &f.to_entry())?;
+                f.id
+            }
+        };
+    }
+    Ok(id)
 }
 
 fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
@@ -461,9 +503,9 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
 fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<i32> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
-    let lock = lock(&ws)?;
-    let _guard = lock.read()?;
-    let cache = Cache::open(&ws.gd("cache.db"))?;
+    let mut lock = lock(&ws)?;
+    let _guard = lock.write()?;
+    let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
     let (abs, rel) = target(&ws, path)?;
     let opts = SyncOpts {
         path: path.into(),
@@ -517,9 +559,9 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
 fn update_cache(refresh: bool) -> Result<()> {
     let mut ws = Workspace::find()?;
     let drive = open(&mut ws)?;
-    let lock = lock(&ws)?;
-    let _guard = lock.read()?;
-    let cache = Cache::open(&ws.gd("cache.db"))?;
+    let mut lock = lock(&ws)?;
+    let _guard = lock.write()?;
+    let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
     let before = cache.count()?;
     let spinner = progress::Spinner::start(if refresh {
         "Listing the remote tree..."
@@ -610,4 +652,40 @@ fn status() -> Result<()> {
         Err(_) => println!("Access token    : none (run `dsync init`)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_path_resolves_prefix_and_keeps_missing_tail() {
+        let dir = std::env::temp_dir().join(format!("dsync_real_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Case Dir")).unwrap();
+        std::fs::write(dir.join("Case Dir/x.txt"), b"x").unwrap();
+        let canon = std::fs::canonicalize(&dir).unwrap();
+        // An existing path comes back in canonical form (symlinked prefixes such as /tmp resolved).
+        assert_eq!(
+            real_path(&dir.join("Case Dir/x.txt")),
+            canon.join("Case Dir/x.txt")
+        );
+        // Components that do not exist yet are appended as typed.
+        assert_eq!(
+            real_path(&dir.join("Case Dir/new/deeper.txt")),
+            canon.join("Case Dir/new/deeper.txt")
+        );
+        // On a case-insensitive filesystem the stored spelling wins over the typed one.
+        if dir.join("CASE DIR").exists() {
+            assert_eq!(
+                real_path(&dir.join("CASE DIR/X.TXT")),
+                canon.join("Case Dir/x.txt")
+            );
+            assert_eq!(
+                real_path(&dir.join("CASE DIR/new")),
+                canon.join("Case Dir/new")
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

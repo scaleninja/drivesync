@@ -16,6 +16,23 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/drive";
 /// Refresh when fewer than this many seconds of validity remain.
 const REFRESH_MARGIN_SECS: i64 = 60;
+/// How long `init` waits for the browser to come back with a code.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Read an HTTP request head (up to the blank line, or 8 KiB) from the redirect connection.
+/// Returns None for connections that send nothing usable.
+fn read_request_head(stream: &mut std::net::TcpStream) -> Option<String> {
+    // Only the request line matters (the query string is in it), so stop at the first newline.
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    while buf.len() < 8192 && !buf.contains(&b'\n') {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    (!buf.is_empty()).then(|| String::from_utf8_lossy(&buf).into_owned())
+}
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -106,16 +123,30 @@ impl Auth {
             .stderr(std::process::Stdio::null())
             .spawn();
 
-        // Browsers may open speculative connections that never send a request; skip those.
+        // Browsers may open speculative connections that never send a request; skip those. The
+        // whole wait is bounded so an abandoned login cannot hang the terminal forever.
+        let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
+        listener.set_nonblocking(true)?;
         let (mut stream, query) = loop {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-            let mut buf = [0u8; 8192];
-            let n = match stream.read(&mut buf) {
-                Ok(n) if n > 0 => n,
-                _ => continue,
+            let (mut stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "no browser redirect received within {} minutes; run `dsync init` again",
+                            LOGIN_TIMEOUT.as_secs() / 60
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             };
-            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+            let Some(request) = read_request_head(&mut stream) else {
+                continue;
+            };
             let query = request
                 .lines()
                 .next()

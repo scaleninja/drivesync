@@ -86,9 +86,50 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Drive allows names that cannot be mapped onto a local path ("/", ".", "..", empty).
+/// Drive allows names that cannot be mapped onto a local path ("/", ".", "..", empty, or longer
+/// than the 255 bytes Linux and macOS filesystems accept for one component).
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains('/')
+        && !name.contains('\0')
+}
+
+/// Name of the private temp file a download is written to, next to its destination. Kept short so
+/// it fits the 255-byte component limit whatever the real name's length, and unique per name.
+pub fn part_name(name: &str) -> String {
+    let short: String = name.chars().take(40).collect();
+    let digest = md5::compute(name.as_bytes());
+    format!(
+        ".{short}.{:08x}{PART_SUFFIX}",
+        u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+    )
+}
+
+/// Delete temp files left under `base` by an interrupted earlier download. Returns how many went.
+pub fn remove_stale_parts(root: &Path, base: &Path) -> usize {
+    let mut removed = 0;
+    let walker = WalkDir::new(base)
+        .into_iter()
+        .filter_entry(|e| !e.file_type().is_symlink() && !is_under_gd(root, e.path()));
+    for entry in walker.flatten() {
+        let is_part = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(PART_SUFFIX));
+        if is_part && entry.file_type().is_file() && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn is_under_gd(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .map(|rel| rel.components().any(|c| c.as_os_str() == GD_DIR))
+        .unwrap_or(false)
 }
 
 pub fn join_rel(prefix: &str, name: &str) -> String {
@@ -247,8 +288,46 @@ pub fn local_walk(
     for entry in walker.into_iter().filter_entry(|e| {
         !e.file_type().is_symlink() && !is_ignored(root, ignore, e.path(), e.file_type().is_dir())
     }) {
-        let entry = entry?;
-        let meta = entry.metadata()?;
+        // One unreadable directory must not abort the whole run: it is recorded as an unreadable
+        // entry (reported as `E`, never transferred, exit status non-zero) and the walk goes on.
+        // A file that vanished between readdir and stat is simply no longer there.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e)
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(e) => {
+                let path = e.path().unwrap_or(base).to_path_buf();
+                if path == base {
+                    return Err(e).with_context(|| format!("reading {}", base.display()));
+                }
+                if let Ok(rel) = rel_path(root, &path) {
+                    progress::eprintln(&format!("error: could not read {}: {e}", display(&rel)));
+                    out.insert(
+                        rel,
+                        Entry {
+                            is_dir: true,
+                            unreadable: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+                continue;
+            }
+        };
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e)
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", entry.path().display())),
+        };
         let rel = match rel_path(root, entry.path()) {
             Ok(rel) => rel,
             Err(e) => {
@@ -293,6 +372,18 @@ pub fn file_md5(path: &Path) -> Result<String> {
         }
         ctx.consume(&buf[..n]);
     }
+}
+
+/// MD5 of a file that must still have the `size` and `mtime_ms` seen earlier once it has been
+/// read; a file being written while it is hashed would otherwise be cached under a stat that
+/// describes different bytes, and the plan would be made from a stale snapshot.
+pub fn hash_stable(path: &Path, size: u64, mtime_ms: i64) -> Result<String> {
+    let md5 = file_md5(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.len() != size || mtime_ms_of(&meta) != mtime_ms {
+        bail!("file changed while it was being read; re-run when it is stable");
+    }
+    Ok(md5)
 }
 
 /// Some(true) = identical, Some(false) = different, None = cannot tell without hashing.
@@ -356,7 +447,7 @@ pub fn fill_hashes(
         };
         let result = match cached {
             Some(md5) => Ok(md5),
-            None => file_md5(&root.join(&path)).inspect(|md5| {
+            None => hash_stable(&root.join(&path), size, mtime_ms).inspect(|md5| {
                 if let Err(e) = cache.set_local_hash(&path, size, mtime_ms, md5) {
                     progress::eprintln(&format!(
                         "warning: hash cache update failed for {}: {e:#}",
@@ -473,6 +564,8 @@ pub enum Action {
         path: String,
         existing: Option<Existing>,
         mtime_ms: i64,
+        /// Local MD5 if the plan already computed it; the upload is verified against it.
+        md5: Option<String>,
     },
     /// `expected_local` is the (size, mtime) the plan saw locally, or None if the file was absent;
     /// the destination must still match right before it is replaced.
@@ -602,6 +695,7 @@ pub fn plan_push(
                 path: path.clone(),
                 existing,
                 mtime_ms: l.mtime_ms,
+                md5: l.md5.clone(),
             });
         }
     }
@@ -953,22 +1047,53 @@ fn parallel<T: Send, R: Send>(items: Vec<T>, threads: usize, f: impl Fn(T) -> R 
     std::thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| loop {
-                let Some((i, item)) = queue.lock().unwrap().next() else {
+                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                let Some((i, item)) = next else {
                     break;
                 };
                 let r = f(item);
-                results.lock().unwrap().push((i, r));
+                results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((i, r));
             });
         }
     });
-    let mut results = results.into_inner().unwrap();
+    let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
     results.sort_by_key(|(i, _)| *i);
     results.into_iter().map(|(_, r)| r).collect()
 }
 
+/// Persists resumable-upload sessions in the cache, keyed by the file's stat at upload time, so
+/// a session is only ever resumed for the exact bytes it was opened for.
+struct Sessions<'a> {
+    cache: &'a Cache,
+    size: u64,
+    mtime_ms: i64,
+}
+
+impl crate::drive::SessionStore for Sessions<'_> {
+    fn load(&self, path: &str) -> Option<String> {
+        self.cache
+            .upload_session(path, self.size, self.mtime_ms)
+            .ok()
+            .flatten()
+    }
+    fn save(&self, path: &str, uri: &str) {
+        let _ = self
+            .cache
+            .set_upload_session(path, self.size, self.mtime_ms, uri);
+    }
+    fn clear(&self, path: &str) {
+        let _ = self.cache.clear_upload_session(path);
+    }
+}
+
 /// Execute a push plan. Folders are created level by level, each level in parallel; then file
 /// uploads run in parallel. Every completed action is recorded in the cache immediately, so a
-/// cancelled push resumes cleanly. Returns the number of failures.
+/// cancelled push resumes cleanly. `base_rel` is the pushed subtree's root ("" for the workspace
+/// root), which the caller has already made sure exists on Drive as `base_id`. Returns the
+/// number of failures.
 pub fn exec_push(
     drive: &Drive,
     cache: &Cache,
@@ -992,6 +1117,10 @@ pub fn exec_push(
     let mut uploads = Vec::new();
     for a in actions {
         match a {
+            // The subtree root itself was created by the caller before execution began.
+            Action::Mkdir { path } if path == base_rel => {
+                progress::println(&format!("+ mkdir    {}/", display(&path)))
+            }
             Action::Mkdir { path } => levels
                 .entry(path.matches('/').count())
                 .or_default()
@@ -1000,7 +1129,8 @@ pub fn exec_push(
                 path,
                 existing,
                 mtime_ms,
-            } => uploads.push((path, existing, mtime_ms)),
+                md5,
+            } => uploads.push((path, existing, mtime_ms, md5)),
             Action::Download { .. } => unreachable!(),
         }
     }
@@ -1025,7 +1155,10 @@ pub fn exec_push(
                 }
             }
             let results = parallel(batch, threads, |(path, parent_id)| {
-                let result = drive.create_folder(&parent_id, path.rsplit('/').next().unwrap());
+                // Drive is asked first: a folder that appeared since the index was refreshed is
+                // adopted, never duplicated.
+                let result =
+                    drive.find_or_create_folder(&parent_id, path.rsplit('/').next().unwrap());
                 match &result {
                     Ok(f) => {
                         if let Err(e) = cache.upsert(&path, &f.to_entry()) {
@@ -1058,9 +1191,9 @@ pub fn exec_push(
 
     // Phase 2: files, in parallel. Skip anything whose parent folder failed to be created.
     let mut jobs = Vec::new();
-    for (path, existing, mtime_ms) in uploads {
+    for (path, existing, mtime_ms, md5) in uploads {
         match folder_ids.get(parent_of(&path)) {
-            Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms)),
+            Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms, md5)),
             None => {
                 progress::eprintln(&format!(
                     "x failed   {}: parent folder was not created",
@@ -1076,7 +1209,7 @@ pub fn exec_push(
     let results = parallel(
         jobs,
         threads,
-        |(path, parent_id, existing, planned_mtime)| {
+        |(path, parent_id, existing, planned_mtime, planned_md5)| {
             let local_path = root.join(&path);
             let result = (|| -> Result<crate::drive::File> {
                 // The source is re-read now; if it changed since the plan, its current mtime is what
@@ -1085,29 +1218,54 @@ pub fn exec_push(
                 if meta.file_type().is_symlink() || !meta.is_file() {
                     bail!("source is no longer a regular file");
                 }
-                let mtime_ms = mtime_ms_of(&meta);
+                let (size, mtime_ms) = (meta.len(), mtime_ms_of(&meta));
                 if mtime_ms != planned_mtime {
                     progress::eprintln(&format!(
                         "note: {} changed since the plan was made; uploading its current content",
                         display(&path)
                     ));
                 }
+                // Uploads are verified end to end: the local MD5 (from the plan or the hash cache
+                // when the stat is unchanged, otherwise computed now) must match what Drive stored.
+                let md5 = match planned_md5.filter(|_| mtime_ms == planned_mtime) {
+                    Some(m) => m,
+                    None => match cache.local_hash(&path, size, mtime_ms)? {
+                        Some(m) => m,
+                        None => hash_stable(&local_path, size, mtime_ms)?,
+                    },
+                };
+                let sessions = Sessions {
+                    cache,
+                    size,
+                    mtime_ms,
+                };
                 let f = drive.upload(
-                    &parent_id,
-                    path.rsplit('/').next().unwrap(),
-                    existing.as_ref(),
-                    &local_path,
-                    &fmt_ms(mtime_ms),
+                    &crate::drive::Upload {
+                        parent_id: &parent_id,
+                        name: path.rsplit('/').next().unwrap(),
+                        existing: existing.as_ref(),
+                        local: &local_path,
+                        rel: &path,
+                        modified_time: &fmt_ms(mtime_ms),
+                    },
+                    &sessions,
                 )?;
+                let after = std::fs::symlink_metadata(&local_path)?;
+                if after.len() != size || mtime_ms_of(&after) != mtime_ms {
+                    bail!("file changed during the upload; re-run to push its current content");
+                }
+                if let Some(remote) = &f.md5_checksum {
+                    if *remote != md5 {
+                        bail!("checksum mismatch after upload (local {md5}, Drive {remote}); re-run to push it again");
+                    }
+                }
                 if let Err(e) = cache.upsert(&path, &f.to_entry()) {
                     progress::eprintln(&format!(
                         "warning: cache update failed for {}: {e:#}",
                         display(&path)
                     ));
                 }
-                if let Some(md5) = &f.md5_checksum {
-                    let _ = cache.set_local_hash(&path, meta.len(), mtime_ms, md5);
-                }
+                let _ = cache.set_local_hash(&path, size, mtime_ms, &md5);
                 Ok(f)
             })();
             match &result {
@@ -1196,9 +1354,10 @@ pub fn exec_pull(
                 }
                 let tmp = drive.download_to_temp(&id, &dest, md5.as_deref())?;
                 finalize_download(&tmp, &dest, expected_local, mtime_ms)?;
-                if let (Some(md5), Ok(meta)) = (&md5, std::fs::metadata(&dest)) {
-                    let _ = cache.set_local_hash(&path, meta.len(), mtime_ms, md5);
-                    // next diff needs no read
+                if let (Some(md5), Ok(meta)) = (&md5, std::fs::symlink_metadata(&dest)) {
+                    // Keyed by the stat the filesystem actually kept (coarser timestamps on
+                    // FAT, HFS+ or network shares round the mtime), so the next diff needs no read.
+                    let _ = cache.set_local_hash(&path, meta.len(), mtime_ms_of(&meta), md5);
                 }
                 Ok(())
             })();
@@ -1501,7 +1660,8 @@ mod tests {
                 Action::Upload {
                     path: "d/new.txt".into(),
                     existing: None,
-                    mtime_ms: 5000
+                    mtime_ms: 5000,
+                    md5: local["d/new.txt"].md5.clone(),
                 },
                 Action::Upload {
                     path: "newer.txt".into(),
@@ -1510,7 +1670,8 @@ mod tests {
                         mtime_ms: 1000,
                         md5: Some("b2".into())
                     }),
-                    mtime_ms: 9000
+                    mtime_ms: 9000,
+                    md5: local["newer.txt"].md5.clone(),
                 },
             ]
         );
@@ -1664,7 +1825,8 @@ mod tests {
             vec![Action::Upload {
                 path: "plain.txt".into(),
                 existing: None,
-                mtime_ms: 1
+                mtime_ms: 1,
+                md5: local["plain.txt"].md5.clone(),
             }]
         );
         assert!(case_collisions(&local, &BTreeMap::new()).is_empty());
@@ -1903,6 +2065,7 @@ mod tests {
                 md5: None,
             }),
             mtime_ms,
+            md5: None,
         };
         let down = |path: &str, mtime_ms: i64| Action::Download {
             path: path.into(),
@@ -2137,6 +2300,86 @@ mod tests {
     fn rfc3339_roundtrip() {
         let ms = parse_rfc3339_ms("2026-09-08T10:20:30.123Z").unwrap();
         assert_eq!(fmt_ms(ms), "2026-09-08T10:20:30.123Z");
+    }
+
+    #[test]
+    fn part_names_are_short_unique_and_reserved() {
+        let long = "x".repeat(300);
+        let a = part_name(&long);
+        let b = part_name(&format!("{long}y"));
+        assert!(a.len() <= 255 && a.ends_with(PART_SUFFIX) && a.starts_with('.'));
+        assert_ne!(a, b, "names that share a prefix get different temp files");
+        assert_eq!(part_name("f.txt"), part_name("f.txt"));
+        assert!(is_reserved(&part_name("f.txt")));
+        assert!(is_reserved(&format!("sub/{}", part_name("f.txt"))));
+        // 40 multi-byte characters stay within the limit.
+        let wide = "日".repeat(200);
+        assert!(part_name(&wide).len() <= 255);
+    }
+
+    #[test]
+    fn stale_part_files_are_removed_but_nothing_else() {
+        let dir = tmpdir("parts");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join(".gd")).unwrap();
+        std::fs::write(dir.join(part_name("a.txt")), b"partial").unwrap();
+        std::fs::write(dir.join("sub").join(part_name("b.txt")), b"partial").unwrap();
+        std::fs::write(dir.join(".gd").join(part_name("c")), b"keep").unwrap();
+        std::fs::write(dir.join("a.txt"), b"real").unwrap();
+        assert_eq!(remove_stale_parts(&dir, &dir), 2);
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join(".gd").join(part_name("c")).exists());
+        assert_eq!(remove_stale_parts(&dir, &dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hash_stable_rejects_a_file_that_changed_while_read() {
+        let dir = tmpdir("stable");
+        let f = dir.join("f.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        let (size, mtime) = (meta.len(), mtime_ms_of(&meta));
+        assert_eq!(
+            hash_stable(&f, size, mtime).unwrap(),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
+        // The snapshot said 5 bytes; the file is now longer, so the hash is not trusted.
+        std::fs::write(&f, b"hello world").unwrap();
+        assert!(hash_stable(&f, size, mtime).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_reported_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("unreadable");
+        std::fs::create_dir_all(dir.join("locked")).unwrap();
+        std::fs::write(dir.join("locked/secret.txt"), b"s").unwrap();
+        std::fs::write(dir.join("ok.txt"), b"o").unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let readable = std::fs::read_dir(dir.join("locked")).is_ok(); // true when running as root
+        let ignore = load_ignore(&dir);
+        let walk = local_walk(&dir, &dir, -1, &ignore);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let walk = walk.unwrap();
+        assert!(walk.contains_key("ok.txt"));
+        if !readable {
+            assert!(walk["locked"].unreadable && walk["locked"].is_dir);
+            assert!(!walk.contains_key("locked/secret.txt"));
+            let remote: BTreeMap<_, _> = [("locked".to_string(), e(1, None, true))]
+                .into_iter()
+                .collect();
+            let plan = plan_push(&walk, &remote, false, &none());
+            assert_eq!(plan.errors.len(), 1);
+            assert!(plan.actions.iter().all(|a| a.path() != "locked"));
+            let plan = plan_pull(&walk, &remote, false, &none());
+            assert_eq!(plan.errors.len(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
