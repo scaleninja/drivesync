@@ -188,10 +188,14 @@ The guards:
   must still have the size and mtime the plan saw, nothing is followed through a symlink, and a
   local folder is only removed when empty. Anything that changed in between is left alone and
   reported.
-- Never deleted: Google Docs, Sheets and Slides, names that collide only by case or Unicode
-  normalization on a case-folding filesystem, anything below a local folder that could not be
-  read, and anything `.driveignore` excludes. A folder that still contains such entries (a
-  `.DS_Store`, a Google Doc, or content beyond the configured depth) is kept and reported as skipped.
+- Never deleted: Google Docs, Sheets and Slides; names that collide only by case or Unicode
+  normalization on a case-folding filesystem; anything below a path that is a folder on one side
+  and a file on the other; anything below a local folder that could not be read; anything
+  `.driveignore` excludes; and, on push, anything that exists locally in a form the sync does not
+  cover (a symlink, a special file, or a folder the ignore rules prune). A folder that still
+  contains such entries (a `.DS_Store`, a Google Doc, or content beyond the configured depth) is
+  kept and reported as skipped, as is a Drive file owned by someone else, which only its owner can
+  trash.
 
 ## Known limitations
 

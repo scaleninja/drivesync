@@ -129,9 +129,17 @@ impl Cache {
         upsert(&self.conn(), path, e)
     }
 
-    /// Drop `path` and everything below it from the index (after a trash on Drive).
+    #[cfg(test)]
     pub fn remove(&self, path: &str) -> Result<()> {
         remove(&self.conn(), path)
+    }
+
+    /// Drop `path` after it was trashed on Drive, and queue a shallow listing of its parent so a
+    /// same-named duplicate the index had suppressed is found on the next refresh.
+    pub fn remove_and_rescan_parent(&self, path: &str, root_id: &str) -> Result<()> {
+        let conn = self.conn();
+        remove(&conn, path)?;
+        queue_parent(&conn, path, root_id)
     }
 
     #[cfg(test)]

@@ -152,6 +152,8 @@ pub enum Trash {
     Gone,
     /// A folder that still has live children; left alone.
     NotEmpty,
+    /// Drive refused: only the owner may trash a file, and this one belongs to someone else.
+    Forbidden,
 }
 
 /// Time allowed for a request that carries `bytes` of body: a fixed allowance plus a floor
@@ -450,12 +452,16 @@ impl Drive {
             }
         }
         let url = format!("{}/{id}", self.api);
-        self.send(&move |c| {
+        match self.send(&move |c| {
             Ok(c.patch(&url)
                 .query(&[("fields", "id,trashed")])
                 .json(&serde_json::json!({ "trashed": true })))
-        })?;
-        Ok(Trash::Done)
+        }) {
+            Ok(_) => Ok(Trash::Done),
+            Err(e) if is_status(&e, StatusCode::NOT_FOUND) => Ok(Trash::Gone),
+            Err(e) if is_status(&e, StatusCode::FORBIDDEN) => Ok(Trash::Forbidden),
+            Err(e) => Err(e),
+        }
     }
 
     /// Parent ids of `id` if it is still a live (not trashed, not deleted) folder; None otherwise.

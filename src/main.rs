@@ -432,6 +432,7 @@ fn push(o: &SyncOpts) -> Result<()> {
     let mut plan = sync::plan_push(&snap.local, &snap.remote, o.force, &snap.collisions);
     if o.delete {
         let (deletions, skips) = sync::plan_deletions(
+            &ws.root,
             &snap.local,
             &snap.remote,
             &snap.collisions,
@@ -453,7 +454,7 @@ fn push(o: &SyncOpts) -> Result<()> {
     };
     let base_id = ensure_remote_folder(&drive, &cache, &ws, &base_rel)?;
     let mut total = plan.actions.len();
-    let mut failures = sync::exec_push(
+    let transfer_failures = sync::exec_push(
         &drive,
         &cache,
         &ws.root,
@@ -462,13 +463,14 @@ fn push(o: &SyncOpts) -> Result<()> {
         &base_id,
         plan.actions,
         o.threads.into(),
-    )? + plan.errors.len();
+    )?;
+    let mut failures = transfer_failures + plan.errors.len();
     if !plan.deletions.is_empty() {
-        if failures > 0 {
-            skip_deletions(plan.deletions.len(), failures);
+        if transfer_failures > 0 {
+            skip_deletions(plan.deletions.len(), transfer_failures);
         } else {
-            total += plan.deletions.len();
-            failures += sync::exec_delete_remote(
+            let planned = plan.deletions.len();
+            let done = sync::exec_delete_remote(
                 &drive,
                 &cache,
                 &ws.root,
@@ -476,21 +478,25 @@ fn push(o: &SyncOpts) -> Result<()> {
                 plan.deletions,
                 o.threads.into(),
             )?;
+            total += planned - done.skipped;
+            failures += done.failed;
         }
     }
     finish("push", total, failures)
 }
 
-/// Whether the source side of `--delete` holds anything besides the selected folder itself.
+/// Whether the source side of `--delete` holds anything besides the selected folder itself and
+/// the ignore file `init` creates, i.e. whether syncing it with `--delete` would clear the other side.
 fn has_content(side: &Snapshot, rel: &str) -> bool {
-    side.keys().any(|p| p != rel)
+    side.keys().any(|p| p != rel && p != config::IGNORE_FILE)
 }
 
-/// rsync's rule: deletions are skipped when anything else went wrong, so a partial run can never
-/// remove what it failed to copy.
+/// rsync's rule: deletions are skipped when a transfer failed, so a partial run can never remove
+/// what it failed to copy. (Local files that could not be read do not count: they exist on both
+/// sides, and planning already leaves everything below an unreadable folder alone.)
 fn skip_deletions(planned: usize, failures: usize) {
     eprintln!(
-        "skipping {planned} deletion(s) because {failures} item(s) failed; re-run once the transfers succeed"
+        "skipping {planned} deletion(s) because {failures} transfer(s) failed; re-run once they succeed"
     );
 }
 
@@ -515,6 +521,7 @@ fn pull(o: &SyncOpts) -> Result<()> {
     let mut plan = sync::plan_pull(&snap.local, &snap.remote, o.force, &snap.collisions);
     if o.delete {
         let (deletions, skips) = sync::plan_deletions(
+            &ws.root,
             &snap.local,
             &snap.remote,
             &snap.collisions,
@@ -528,14 +535,17 @@ fn pull(o: &SyncOpts) -> Result<()> {
         return finish("pull", 0, plan.errors.len());
     }
     let mut total = plan.actions.len();
-    let mut failures = sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?
-        + plan.errors.len();
+    let transfer_failures =
+        sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?;
+    let mut failures = transfer_failures + plan.errors.len();
     if !plan.deletions.is_empty() {
-        if failures > 0 {
-            skip_deletions(plan.deletions.len(), failures);
+        if transfer_failures > 0 {
+            skip_deletions(plan.deletions.len(), transfer_failures);
         } else {
-            total += plan.deletions.len();
-            failures += sync::exec_delete_local(&ws.root, plan.deletions, &sync::remove_local);
+            let planned = plan.deletions.len();
+            let done = sync::exec_delete_local(&ws.root, plan.deletions, &sync::remove_local);
+            total += planned - done.skipped;
+            failures += done.failed;
         }
     }
     finish("pull", total, failures)

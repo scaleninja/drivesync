@@ -575,9 +575,13 @@ fn remote_deletions_are_verified_before_trashing() {
         .upsert("full/child", &entry(file("CHILD", "child", "FULL", false)))
         .unwrap();
 
-    let failures =
+    let done =
         sync::exec_delete_remote(&server.drive(), &cache, &root.0, "ROOT", deletions, 4).unwrap();
-    assert_eq!(failures, 1, "only the file whose content changed fails");
+    assert_eq!(done.failed, 1, "only the file whose content changed fails");
+    assert_eq!(
+        done.skipped, 3,
+        "the non-empty folder, the already-gone file, the local one"
+    );
     let mut trashed = patched.lock().unwrap().clone();
     trashed.sort();
     assert_eq!(trashed, ["/files/EMPTY", "/files/OLD"]);
@@ -590,6 +594,14 @@ fn remote_deletions_are_verified_before_trashing() {
     assert!(cache.entry("full/child").unwrap().is_some());
     assert!(cache.entry("local.txt").unwrap().is_some());
     assert!(root.0.join("local.txt").exists());
+    // A vacated path may hide a same-named duplicate: the parent is queued for a shallow listing.
+    let pending = cache.pending_walks().unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|(id, path, _)| id == "ROOT" && path.is_empty()),
+        "{pending:?}"
+    );
 }
 
 #[test]
@@ -632,10 +644,10 @@ fn remote_deletions_below_a_moved_folder_are_not_trashed() {
             md5: top.md5.clone(),
         },
     ];
-    let failures =
+    let done =
         sync::exec_delete_remote(&server.drive(), &cache, &root.0, "ROOT", deletions, 2).unwrap();
     assert_eq!(
-        failures, 1,
+        done.failed, 1,
         "the entry under the moved folder is reported, not trashed"
     );
     assert_eq!(*patched.lock().unwrap(), vec!["/files/TOP".to_string()]);
