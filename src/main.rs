@@ -9,6 +9,9 @@ mod drive;
 mod progress;
 mod sync;
 
+#[cfg(test)]
+mod regression_tests;
+
 use anyhow::{bail, Context, Result};
 use cache::Cache;
 use clap::{Parser, Subcommand};
@@ -478,12 +481,21 @@ fn pull(o: &SyncOpts) -> Result<()> {
 /// any missing level and recording each one in the index. Drive is consulted for every level
 /// the index does not know, so a folder created elsewhere is adopted rather than duplicated.
 fn ensure_remote_folder(drive: &Drive, cache: &Cache, ws: &Workspace, rel: &str) -> Result<String> {
+    drive.check_folder(&ws.config.remote_folder_id)?;
     let mut id = ws.config.remote_folder_id.clone();
     let mut path = String::new();
     for part in rel.split('/').filter(|p| !p.is_empty()) {
         path = sync::join_rel(&path, part);
         id = match cache.entry(&path)?.filter(|e| e.is_dir).and_then(|e| e.id) {
-            Some(id) => id,
+            Some(child) => {
+                if !drive
+                    .live_folder_parents(&child)?
+                    .is_some_and(|parents| parents.contains(&id))
+                {
+                    bail!("remote folder {path} moved, was trashed or deleted; re-run to re-plan");
+                }
+                child
+            }
             None => {
                 let f = drive.find_or_create_folder(&id, part)?;
                 cache.upsert(&path, &f.to_entry())?;

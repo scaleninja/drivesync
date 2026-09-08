@@ -19,6 +19,10 @@ use std::sync::{Mutex, MutexGuard};
 const TOKEN_KEY: &str = "start_page_token";
 const UPDATED_KEY: &str = "updated_at";
 const DEPTH_KEY: &str = "depth";
+/// Marker in `pending_walks.depth`: list the folder's direct children and add whatever the index
+/// lacks (a duplicate that was suppressed while another entry owned its path), touching nothing
+/// else. Any other value means a full walk of the folder to the configured depth.
+const SHALLOW_WALK: i32 = -2;
 /// `path = ?1 OR path starts with ?1 + "/"` — exact, case-sensitive subtree match.
 const SUBTREE: &str = "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')";
 
@@ -188,7 +192,8 @@ impl Cache {
         Ok(())
     }
 
-    /// The resumable-upload session recorded for a local file, valid only while its stat is unchanged.
+    /// Serialized resumable-upload context for a local file with matching stat. The original
+    /// `uri` column is retained for compatibility; callers discard legacy URI-only records.
     pub fn upload_session(&self, path: &str, size: u64, mtime_ms: i64) -> Result<Option<String>> {
         Ok(self
             .conn()
@@ -318,6 +323,10 @@ fn upsert(conn: &Connection, path: &str, e: &Entry) -> Result<()> {
 
 fn remove(conn: &Connection, path: &str) -> Result<()> {
     conn.execute(&format!("DELETE FROM files WHERE {SUBTREE}"), params![path])?;
+    conn.execute(
+        &format!("DELETE FROM pending_walks WHERE {SUBTREE}"),
+        params![path],
+    )?;
     Ok(())
 }
 
@@ -325,6 +334,12 @@ fn rename(conn: &Connection, old: &str, new: &str) -> Result<()> {
     remove(conn, new)?;
     conn.execute(
         &format!("UPDATE files SET path = ?2 || substr(path, length(?1) + 1) WHERE {SUBTREE}"),
+        params![old, new],
+    )?;
+    conn.execute(
+        &format!(
+            "UPDATE pending_walks SET path = ?2 || substr(path, length(?1) + 1) WHERE {SUBTREE}"
+        ),
         params![old, new],
     )?;
     Ok(())
@@ -376,8 +391,7 @@ pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bo
     drive.check_folder(root_id)?;
     let same_depth = cache.meta(DEPTH_KEY)?.as_deref() == Some(&depth.to_string());
     if let (false, true, Some(token)) = (full, same_depth, cache.meta(TOKEN_KEY)?) {
-        let incremental = drain_pending(drive, cache)
-            .and_then(|()| apply_changes(drive, cache, root_id, depth, &token));
+        let incremental = apply_changes(drive, cache, root_id, depth, &token);
         match incremental {
             Ok(()) => return Ok(()),
             Err(e) => crate::progress::eprintln(&format!("warning: incremental cache refresh failed ({e:#}); listing the remote tree in full")),
@@ -391,18 +405,93 @@ pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bo
 
 /// List every folder recorded in `pending_walks` (from this run or an interrupted earlier one) and
 /// store its contents. Each folder is removed from the table in the same transaction as its rows.
-fn drain_pending(drive: &Drive, cache: &Cache) -> Result<()> {
-    for (id, path, remaining) in cache.pending_walks()? {
+fn drain_pending(drive: &Drive, cache: &Cache, root_id: &str, depth: i32) -> Result<()> {
+    // Each task is resolved against the current index when it runs (tasks may predate a rename,
+    // or come from an older version), and the queue is re-read after every task because a full
+    // walk also completes any nested tasks.
+    while let Some((id, _, kind)) = cache.pending_walks()?.into_iter().next() {
+        let path = if id == root_id {
+            Some(String::new())
+        } else {
+            path_of_id(&cache.conn(), &id)?
+        };
+        let Some(path) = path else {
+            cache
+                .conn()
+                .execute("DELETE FROM pending_walks WHERE id = ?1", [&id])?;
+            continue;
+        };
+        let level = if path.is_empty() {
+            0
+        } else {
+            path.matches('/').count() as i32 + 1
+        };
+        let remaining = if depth < 0 {
+            -1
+        } else {
+            (depth - level).max(0)
+        };
+        if kind == SHALLOW_WALK {
+            reconcile_children(drive, cache, &id, &path, depth, remaining)?;
+            continue;
+        }
         let mut sub = BTreeMap::new();
         drive.walk(&id, &path, remaining, &mut sub)?;
         let conn = cache.conn();
         let tx = conn.unchecked_transaction()?;
+        // Replace, rather than append, so removed entries and former duplicate owners disappear.
+        tx.execute(
+            "DELETE FROM files WHERE ?1 = '' OR (path != ?1 AND substr(path, 1, length(?1) + 1) = ?1 || '/')",
+            [&path],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM pending_walks WHERE ?1 = '' OR {SUBTREE}"),
+            [&path],
+        )?;
         for (p, e) in &sub {
             upsert(&tx, p, e)?;
         }
         tx.execute("DELETE FROM pending_walks WHERE id = ?1", [&id])?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// One listing of a folder's direct children: entries the index lacks are added (first of any
+/// duplicate name wins, as everywhere), and a newly found folder is queued for a full walk.
+/// Nothing is removed; removals arrive through the Changes feed.
+fn reconcile_children(
+    drive: &Drive,
+    cache: &Cache,
+    id: &str,
+    path: &str,
+    depth: i32,
+    remaining: i32,
+) -> Result<()> {
+    let children = if remaining == 0 {
+        Vec::new() // the folder sits at the depth limit; its children are out of scope
+    } else {
+        drive.list_children(id)?
+    };
+    let conn = cache.conn();
+    let tx = conn.unchecked_transaction()?;
+    for f in children {
+        if !crate::sync::valid_name(&f.name) {
+            continue;
+        }
+        let rel = join_rel(path, &f.name);
+        if id_at(&tx, &rel)?.is_some() {
+            continue;
+        }
+        let entry = f.to_entry();
+        upsert(&tx, &rel, &entry)?;
+        if entry.is_dir {
+            let level = rel.matches('/').count() as i32 + 1;
+            add_pending(&tx, &f.id, &rel, if depth < 0 { -1 } else { depth - level })?;
+        }
+    }
+    tx.execute("DELETE FROM pending_walks WHERE id = ?1", [id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -425,7 +514,7 @@ fn apply_changes(
     // Network calls happen with no transaction open, so other instances are not blocked. The token
     // is only advanced once everything is stored; a failure or crash here leaves the pending walks
     // on disk and the old token in place, so the next run finishes the job.
-    drain_pending(drive, cache)?;
+    drain_pending(drive, cache, root_id, depth)?;
     let conn = cache.conn();
     touch(&conn, &new_token, depth)
 }
@@ -442,7 +531,11 @@ fn apply_change(tx: &Connection, ch: Change, root_id: &str, depth: i32) -> Resul
     };
     let old_path = path_of_id(tx, file_id)?;
     let drop_old = |conn: &Connection| -> Result<()> {
-        old_path.as_deref().map_or(Ok(()), |p| remove(conn, p))
+        if let Some(p) = old_path.as_deref() {
+            remove(conn, p)?;
+            queue_parent(conn, p, root_id)?;
+        }
+        Ok(())
     };
     let Some(f) = ch.file.filter(|f| !ch.removed && !f.trashed) else {
         return drop_old(tx);
@@ -484,6 +577,7 @@ fn apply_change(tx: &Connection, ch: Change, root_id: &str, depth: i32) -> Resul
     }
     if let Some(old) = old_path.as_deref().filter(|_| moved) {
         rename(tx, old, &new_path)?;
+        queue_parent(tx, old, root_id)?;
     }
     let entry = f.file.to_entry();
     upsert(tx, &new_path, &entry)?;
@@ -497,6 +591,24 @@ fn apply_change(tx: &Connection, ch: Change, root_id: &str, depth: i32) -> Resul
             prune_deeper(tx, &new_path, depth)?;
             add_pending(tx, &f.file.id, &new_path, remaining)?;
         }
+    }
+    Ok(())
+}
+
+/// A suppressed duplicate may still occupy a vacated path: queue a shallow listing of the parent.
+/// An existing full-walk task for that folder is never downgraded.
+fn queue_parent(conn: &Connection, path: &str, root_id: &str) -> Result<()> {
+    let parent = crate::sync::parent_of(path);
+    let id = if parent.is_empty() {
+        Some(root_id.to_string())
+    } else {
+        id_at(conn, parent)?
+    };
+    if let Some(id) = id {
+        conn.execute(
+            "INSERT INTO pending_walks(id, path, depth) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO NOTHING",
+            params![id, parent, SHALLOW_WALK],
+        )?;
     }
     Ok(())
 }
@@ -698,6 +810,47 @@ mod tests {
     }
 
     #[test]
+    fn shallow_reconcile_never_downgrades_a_full_walk() {
+        let c = Cache::open(Path::new(":memory:")).unwrap();
+        c.upsert("d", &e("D", true)).unwrap();
+        c.upsert("d/f.txt", &e("F", false)).unwrap();
+        c.add_pending("D", "d", -1).unwrap(); // a full walk is already queued for d
+        queue_parent(&c.conn(), "d/f.txt", "ROOT").unwrap();
+        assert_eq!(
+            c.pending_walks().unwrap(),
+            vec![("D".into(), "d".into(), -1)]
+        );
+        // With nothing queued, a vacated path queues a shallow listing of its parent.
+        c.upsert("top.txt", &e("T", false)).unwrap();
+        queue_parent(&c.conn(), "top.txt", "ROOT").unwrap();
+        assert!(c
+            .pending_walks()
+            .unwrap()
+            .contains(&("ROOT".into(), "".into(), SHALLOW_WALK)));
+        // A later full walk for the same folder replaces the shallow one.
+        c.add_pending("ROOT", "", -1).unwrap();
+        assert!(c
+            .pending_walks()
+            .unwrap()
+            .contains(&("ROOT".into(), "".into(), -1)));
+    }
+
+    #[test]
+    fn pending_descendants_follow_rename_and_are_cancelled_on_removal() {
+        let c = Cache::open(Path::new(":memory:")).unwrap();
+        c.upsert("a", &e("A", true)).unwrap();
+        c.upsert("a/b", &e("B", true)).unwrap();
+        c.add_pending("B", "a/b", -1).unwrap();
+        c.rename("a", "z").unwrap();
+        assert_eq!(
+            c.pending_walks().unwrap(),
+            vec![("B".into(), "z/b".into(), -1)]
+        );
+        c.remove("z").unwrap();
+        assert!(c.pending_walks().unwrap().is_empty());
+    }
+
+    #[test]
     fn local_hash_pruning_is_scoped() {
         let c = Cache::open(Path::new(":memory:")).unwrap();
         for p in ["a/keep.txt", "a/gone.txt", "b/other.txt", "A/case.txt"] {
@@ -839,6 +992,8 @@ mod tests {
         assert_eq!(
             c.pending_walks().unwrap(),
             vec![
+                ("ROOT".into(), "".into(), SHALLOW_WALK),
+                ("B".into(), "b".into(), SHALLOW_WALK),
                 ("N".into(), "n".into(), 1),
                 ("DEEP".into(), "n/deep".into(), 0)
             ]

@@ -557,7 +557,7 @@ pub fn diff(
 }
 
 /// What the plan saw on Drive for a file that will be updated; re-checked before the upload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Existing {
     pub id: String,
     pub mtime_ms: i64,
@@ -574,8 +574,6 @@ pub enum Action {
         path: String,
         existing: Option<Existing>,
         mtime_ms: i64,
-        /// Local MD5 if the plan already computed it; the upload is verified against it.
-        md5: Option<String>,
     },
     /// `expected_local` is the (size, mtime) the plan saw locally, or None if the file was absent;
     /// the destination must still match right before it is replaced.
@@ -705,7 +703,6 @@ pub fn plan_push(
                 path: path.clone(),
                 existing,
                 mtime_ms: l.mtime_ms,
-                md5: l.md5.clone(),
             });
         }
     }
@@ -1083,30 +1080,29 @@ struct Sessions<'a> {
 }
 
 impl crate::drive::SessionStore for Sessions<'_> {
-    fn load(&self, path: &str) -> Option<String> {
-        self.cache
-            .upload_session(path, self.size, self.mtime_ms)
-            .ok()
-            .flatten()
-    }
-    fn save(&self, path: &str, uri: &str) {
-        if let Err(e) = self
-            .cache
-            .set_upload_session(path, self.size, self.mtime_ms, uri)
-        {
-            progress::eprintln(&format!(
-                "warning: could not record the upload session for {} ({e:#}); an interrupted upload will restart from zero",
-                display(path)
-            ));
+    fn load(&self, path: &str) -> Result<Option<crate::drive::UploadSession>> {
+        match self.cache.upload_session(path, self.size, self.mtime_ms)? {
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(session) => Ok(Some(session)),
+                Err(_) => {
+                    // Legacy sessions contain only a URI and cannot establish remote ownership.
+                    self.cache.clear_upload_session(path)?;
+                    Ok(None)
+                }
+            },
+            None => Ok(None),
         }
     }
-    fn clear(&self, path: &str) {
-        if let Err(e) = self.cache.clear_upload_session(path) {
-            progress::eprintln(&format!(
-                "warning: could not clear the upload session for {}: {e:#}",
-                display(path)
-            ));
-        }
+    fn save(&self, path: &str, session: &crate::drive::UploadSession) -> Result<()> {
+        self.cache.set_upload_session(
+            path,
+            self.size,
+            self.mtime_ms,
+            &serde_json::to_string(session)?,
+        )
+    }
+    fn clear(&self, path: &str) -> Result<()> {
+        self.cache.clear_upload_session(path)
     }
 }
 
@@ -1216,8 +1212,7 @@ pub fn exec_push(
                 path,
                 existing,
                 mtime_ms,
-                md5,
-            } => uploads.push((path, existing, mtime_ms, md5)),
+            } => uploads.push((path, existing, mtime_ms)),
             Action::Download { .. } => unreachable!(),
         }
     }
@@ -1278,9 +1273,9 @@ pub fn exec_push(
 
     // Phase 2: files, in parallel. Skip anything whose parent folder failed to be created.
     let mut jobs = Vec::new();
-    for (path, existing, mtime_ms, md5) in uploads {
+    for (path, existing, mtime_ms) in uploads {
         match folder_ids.get(parent_of(&path)) {
-            Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms, md5)),
+            Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms)),
             None => {
                 progress::eprintln(&format!(
                     "x failed   {}: parent folder is not available on Drive",
@@ -1296,7 +1291,7 @@ pub fn exec_push(
     let results = parallel(
         jobs,
         threads,
-        |(path, parent_id, existing, planned_mtime, planned_md5)| {
+        |(path, parent_id, existing, planned_mtime)| {
             let local_path = root.join(&path);
             let result = (|| -> Result<crate::drive::File> {
                 // The source is re-read now; if it changed since the plan, its current mtime is what
@@ -1312,15 +1307,8 @@ pub fn exec_push(
                         display(&path)
                     ));
                 }
-                // Uploads are verified end to end: the local MD5 (from the plan or the hash cache
-                // when the stat is unchanged, otherwise computed now) must match what Drive stored.
-                let md5 = match planned_md5.filter(|_| mtime_ms == planned_mtime) {
-                    Some(m) => m,
-                    None => match cache.local_hash(&path, size, mtime_ms)? {
-                        Some(m) => m,
-                        None => hash_stable(&local_path, size, mtime_ms)?,
-                    },
-                };
+                // Fresh bytes bind resumed sessions even when an editor preserves size and mtime.
+                let md5 = hash_stable(&local_path, size, mtime_ms)?;
                 let sessions = Sessions {
                     cache,
                     size,
@@ -1334,6 +1322,7 @@ pub fn exec_push(
                         local: &local_path,
                         rel: &path,
                         modified_time: &fmt_ms(mtime_ms),
+                        md5: &md5,
                     },
                     &sessions,
                 )?;
@@ -1393,7 +1382,10 @@ fn folders_to_verify<'a>(
     let mut out = BTreeSet::new();
     for parent in parents {
         let mut p = parent;
-        while !p.is_empty() && known(p) && out.insert(p.to_string()) {
+        while !p.is_empty() {
+            if known(p) && !out.insert(p.to_string()) {
+                break;
+            }
             p = parent_of(p);
         }
     }
@@ -1770,7 +1762,6 @@ mod tests {
                     path: "d/new.txt".into(),
                     existing: None,
                     mtime_ms: 5000,
-                    md5: local["d/new.txt"].md5.clone(),
                 },
                 Action::Upload {
                     path: "newer.txt".into(),
@@ -1780,7 +1771,6 @@ mod tests {
                         md5: Some("b2".into())
                     }),
                     mtime_ms: 9000,
-                    md5: local["newer.txt"].md5.clone(),
                 },
             ]
         );
@@ -1935,7 +1925,6 @@ mod tests {
                 path: "plain.txt".into(),
                 existing: None,
                 mtime_ms: 1,
-                md5: local["plain.txt"].md5.clone(),
             }]
         );
         assert!(case_collisions(&local, &BTreeMap::new()).is_empty());
@@ -2174,7 +2163,6 @@ mod tests {
                 md5: None,
             }),
             mtime_ms,
-            md5: None,
         };
         let down = |path: &str, mtime_ms: i64| Action::Download {
             path: path.into(),
@@ -2420,8 +2408,12 @@ mod tests {
             out.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["a", "a/b", "a/b/c", "x"]
         );
-        // An unindexed parent ("a/new") contributes nothing; the root never appears.
+        // An unindexed parent is skipped, but its indexed ancestors are still checked.
         assert!(!out.contains("") && !out.contains("a/new"));
+        assert_eq!(
+            folders_to_verify(["a/new/deeper"].into_iter(), &known),
+            BTreeSet::from(["a".into()])
+        );
     }
 
     #[test]
