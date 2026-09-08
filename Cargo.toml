@@ -1,6 +1,6 @@
 [package]
 name = "drivesync"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "DriveSync (dsync): push, pull and diff a local directory against Google Drive"
 license = "MIT"
