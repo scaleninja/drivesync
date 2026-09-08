@@ -175,15 +175,18 @@ pub fn is_reserved(rel: &str) -> bool {
 
 /// Normalize `path` (relative to cwd) to an absolute path without touching the filesystem.
 pub fn absolutize(path: &str) -> Result<PathBuf> {
-    let mut out = std::env::current_dir()?;
     let p = Path::new(path);
-    if p.is_absolute() {
-        out = PathBuf::from("/");
-    }
+    let mut out = if p.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
     for c in p.components() {
         use std::path::Component::*;
         match c {
-            RootDir | CurDir | Prefix(_) => {}
+            // A drive letter or UNC prefix on Windows, then the root itself.
+            Prefix(_) | RootDir => out.push(c.as_os_str()),
+            CurDir => {}
             ParentDir => {
                 out.pop();
             }
@@ -1080,7 +1083,13 @@ pub fn confirm(
             match plan.deletions[0] {
                 Delete::Remote { .. } =>
                     "Deletions move Drive entries to the trash (restorable from Drive for a while).",
-                Delete::Local { .. } if LOCAL_TRASH => "Deletions move local files to the Trash.",
+                Delete::Local { .. } if LOCAL_TRASH => {
+                    if cfg!(target_os = "macos") {
+                        "Deletions move local files to the Trash."
+                    } else {
+                        "Deletions move local files to the Recycle Bin."
+                    }
+                }
                 Delete::Local { .. } =>
                     "Deletions remove local files permanently; there is no trash on this platform.",
             }
@@ -1893,13 +1902,14 @@ pub struct Deleted {
     pub skipped: usize,
 }
 
-/// Whether `pull --delete` moves local entries to the system trash (macOS) or removes them
-/// outright (everywhere else).
-pub const LOCAL_TRASH: bool = cfg!(target_os = "macos");
+/// Whether `pull --delete` moves local entries to the system trash (macOS, Windows) or removes
+/// them outright (everywhere else).
+pub const LOCAL_TRASH: bool = cfg!(any(target_os = "macos", windows));
 
 /// Remove a local file or (empty) folder. On macOS it goes to the user's Trash through
-/// `NSFileManager`, which needs no Finder automation permission; if the Trash is unavailable the
-/// entry stays, there is no fallback to deletion. On Linux it is deleted permanently.
+/// `NSFileManager`, which needs no Finder automation permission; on Windows to the Recycle Bin.
+/// If the trash is unavailable the entry stays: there is no fallback to deletion. On Linux it is
+/// deleted permanently.
 pub fn remove_local(path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -1909,7 +1919,11 @@ pub fn remove_local(path: &Path) -> Result<()> {
         ctx.delete(path)
             .map_err(|e| anyhow::anyhow!("could not move to the Trash: {e}"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        trash::delete(path).map_err(|e| anyhow::anyhow!("could not move to the Recycle Bin: {e}"))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         if std::fs::symlink_metadata(path)?.is_dir() {
             std::fs::remove_dir(path)?;
@@ -2907,7 +2921,16 @@ mod tests {
         );
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(absolutize("a b/../c d").unwrap(), cwd.join("c d"));
+        #[cfg(unix)]
         assert_eq!(absolutize("/x y/./z").unwrap(), PathBuf::from("/x y/z"));
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                absolutize(r"C:\x y\.\z\..\w").unwrap(),
+                PathBuf::from(r"C:\x y\w")
+            );
+            assert_eq!(absolutize(r"C:\..\top").unwrap(), PathBuf::from(r"C:\top"));
+        }
         assert_eq!(ancestors("a/b/c").collect::<Vec<_>>(), vec!["a", "a/b"]);
         assert_eq!(ancestors("top").count(), 0);
     }

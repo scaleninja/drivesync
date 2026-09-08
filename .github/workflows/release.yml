@@ -27,6 +27,7 @@ jobs:
           - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-arm64,  zig: true }
           - { os: macos-latest,  target: x86_64-apple-darwin,        name: macos-x86_64 }
           - { os: macos-latest,  target: aarch64-apple-darwin,       name: macos-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, exe: .exe }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +39,16 @@ jobs:
       - if: matrix.zig
         run: cargo install cargo-zigbuild --locked
       - name: Build
+        shell: bash
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then cargo zigbuild --release --locked --target ${{ matrix.target }}
           else cargo build --release --locked --target ${{ matrix.target }}; fi
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/dsync dist/dsync-${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/dsync${{ matrix.exe }} dist/dsync-${{ matrix.name }}${{ matrix.exe }}
       - name: Runtime smoke test (native targets only)
-        if: matrix.name == 'linux-x86_64' || matrix.name == 'macos-arm64'
-        run: dist/dsync-${{ matrix.name }} version
+        if: matrix.name == 'linux-x86_64' || matrix.name == 'macos-arm64' || matrix.name == 'windows-x86_64'
+        shell: bash
+        run: dist/dsync-${{ matrix.name }}${{ matrix.exe }} version
       - uses: actions/upload-artifact@v4
         with:
           name: dsync-${{ matrix.name }}

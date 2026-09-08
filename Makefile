@@ -6,7 +6,9 @@
 # One-time:      make setup                  (rustup targets + cargo-zigbuild; needs `zig` on PATH)
 #
 # Linux builds use cargo-zigbuild (Zig as the C cross-compiler for bundled SQLite) and target musl,
-# so the binaries are fully static. macOS targets build natively with cargo (run on a Mac).
+# so the binaries are fully static. macOS targets build natively with cargo (run on a Mac). The
+# Windows binary (x86_64, MSVC) is built by the release workflow on a Windows runner; a local
+# cross-check is `cargo zigbuild --target x86_64-pc-windows-gnu`.
 
 BIN      := dsync
 VERSION  := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)

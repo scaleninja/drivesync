@@ -14,7 +14,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: windows-latest, exe: .exe }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,10 +29,11 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Smoke test the binary
+        shell: bash
         run: |
-          ./target/release/dsync version
-          ./target/release/dsync --help
-          ! ./target/release/dsync status 2>/dev/null
+          ./target/release/dsync${{ matrix.exe }} version
+          ./target/release/dsync${{ matrix.exe }} --help
+          ! ./target/release/dsync${{ matrix.exe }} status 2>/dev/null
 
   audit:
     name: dependency advisories

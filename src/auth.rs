@@ -112,12 +112,16 @@ impl Auth {
         println!(
             "Authorize this app by visiting:\n\n  {url}\n\nWaiting for the browser redirect..."
         );
-        let opener = if cfg!(target_os = "macos") {
-            "open"
+        // rundll32 takes the URL as a plain argument, so no shell ever parses its `&`.
+        let (opener, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("open", &[])
+        } else if cfg!(windows) {
+            ("rundll32", &["url.dll,FileProtocolHandler"])
         } else {
-            "xdg-open"
+            ("xdg-open", &[])
         };
         let _ = std::process::Command::new(opener)
+            .args(args)
             .arg(&url)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

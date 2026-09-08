@@ -1,6 +1,6 @@
 [package]
 name = "drivesync"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "DriveSync (dsync): push, pull and diff a local directory against Google Drive"
 license = "MIT"
@@ -28,11 +28,12 @@ ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dunce = "1"
 unicode-normalization = "0.1"
 urlencoding = "2"
 walkdir = "2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 trash = "5"
 
 [profile.release]

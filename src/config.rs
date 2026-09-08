@@ -51,7 +51,10 @@ impl Workspace {
                 }
                 if m.is_dir() {
                     let config = load_json(&dir.join(GD_DIR).join("config.json"))?;
-                    return Ok(Self { root: dir, config });
+                    // On-disk spelling, without Windows' verbatim prefix, so that paths resolved
+                    // the same way later strip cleanly against the root.
+                    let root = dunce::canonicalize(&dir).unwrap_or(dir);
+                    return Ok(Self { root, config });
                 }
             }
             if !dir.pop() {

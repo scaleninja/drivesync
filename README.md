@@ -8,6 +8,10 @@ modelled on [odeke-em/drive](https://github.com/odeke-em/drive).
 - Source: <https://github.com/scaleninja/drivesync>
 - License: [MIT](LICENSE)
 
+> **Tested on:** macOS, with both a consumer `@gmail.com` account and a Google Workspace account.
+> Linux and Windows builds are produced and smoke-tested in CI but have not been exercised against
+> a live Drive; reports welcome.
+
 ```
 dsync init ~/gdrive --remote-folder backups/lab --credentials ~/Downloads/client_secret.json
 cd ~/gdrive
@@ -41,6 +45,10 @@ curl -fL -o /tmp/dsync "https://github.com/scaleninja/drivesync/releases/latest/
   && chmod 755 /tmp/dsync && sudo mv /tmp/dsync /usr/local/bin/dsync
 ```
 
+**Windows** (x86_64): download `dsync-windows-x86_64.exe` from the
+[releases page](https://github.com/scaleninja/drivesync/releases), rename it to `dsync.exe`, and put
+it in a folder on your `PATH`. See [Known limitations](#known-limitations) for Windows notes.
+
 Or from source with a Rust toolchain: `git clone https://github.com/scaleninja/drivesync && cd drivesync && make install`.
 
 ## Setup
@@ -57,7 +65,7 @@ the binary. One-time steps in the [Google Cloud Console](https://console.cloud.g
    then **Download JSON**.
 
 Then initialize a folder. A browser opens for consent; the tool receives the code on a loopback port
-and stores its tokens in `.gd/` inside the folder (mode 0600, never uploaded).
+and stores its tokens in `.gd/` inside the folder (mode 0600 on Unix, never uploaded).
 
 ```bash
 dsync init ~/gdrive --remote-folder backups/lab --credentials ~/Downloads/client_secret.json
@@ -92,7 +100,7 @@ Options for `push`, `pull` and `diff`:
 | `--refresh` | Ignore the cached index and re-list the whole remote tree. |
 | `--fast` | rsync-style quick check: equal size and mtime is trusted without reading the file. |
 | `--verify` | Re-read every file that needs hashing instead of trusting the local hash cache. |
-| `--delete` | `push`/`pull` only. After the transfers, remove from the destination whatever no longer exists on the source: `push` moves Drive entries to the Drive trash; `pull` moves local files to the Trash on macOS and deletes them on Linux. Off by default; see [Deleting](#deleting-with---delete). |
+| `--delete` | `push`/`pull` only. After the transfers, remove from the destination whatever no longer exists on the source: `push` moves Drive entries to the Drive trash; `pull` moves local files to the Trash on macOS or the Recycle Bin on Windows, and deletes them on Linux. Off by default; see [Deleting](#deleting-with---delete). |
 
 Put gitignore-style patterns in `.driveignore` at the sync root to leave things out (`init` creates
 one with `.DS_Store` and `._*`). `.gd/`, symlinks and non-regular files are never synced.
@@ -172,6 +180,7 @@ longer exists on the source, after the transfers. Where things go:
 |---|---|---|
 | `push` | Google Drive | Moves entries to the **Drive trash**, restorable from Drive for a while. |
 | `pull` on macOS | local folder | Moves files to the **Trash** (without Finder's *Put Back* entry; restore by dragging). If the Trash cannot be used, the file stays and the run reports a failure. |
+| `pull` on Windows | local folder | Moves files to the **Recycle Bin**. If it cannot be used, the file stays and the run reports a failure. |
 | `pull` on Linux | local folder | **Deletes permanently.** There is no trash integration on Linux. |
 
 The guards:
@@ -204,7 +213,8 @@ The guards:
   and the write (or, with `--delete`, the trash request) that follows are two requests; a write
   from elsewhere in that window is lost.
 - Pull keeps no local backup: a local file it overwrites (only ever an older one, unless `--force`)
-  is gone; one it removes with `--delete` goes to the Trash on macOS and is deleted on Linux. Push
+  is gone; one it removes with `--delete` goes to the Trash on macOS or the Recycle Bin on Windows
+  and is deleted on Linux. Push
   replaces Drive content, which Drive keeps as a revision for a while, and trashes rather than deletes.
 - A full listing holds every My Drive entry in memory while the tree is assembled.
 - Another local process writing to the sync folder at the same moment as `dsync` is outside the
@@ -214,6 +224,11 @@ The guards:
   SQLite index behaves reliably.
 - The hash cache trusts an unchanged size and mtime, like git; use `--verify` after restoring files
   from a backup or when a tool rewrites files with their mtimes preserved.
+- Windows: the token and cache files in `.gd/` are not given restrictive permissions (there are no
+  Unix mode bits), so rely on your user profile's ACLs. Paths longer than 260 characters are not
+  supported unless long paths are enabled system-wide. Drive names that Windows forbids in file
+  names (`<>:"/\|?*`, or reserved names such as `CON`) cannot be pulled and are reported as
+  failures. Only an x86_64 build is published.
 - Filesystem nuances: on macOS and other case-folding filesystems, names that differ only by case or
   Unicode normalization are one local file, so such pairs are reported as collisions and never
   transferred (HFS+ stores accented names in NFD form, which can trigger this for names created on
@@ -229,8 +244,9 @@ make all-targets                        # Linux (static musl via cargo-zigbuild)
 make setup                              # one-time: rustup targets + cargo-zigbuild (needs zig)
 ```
 
-Windows is not supported. CI runs fmt, clippy, tests and a locked build on every push and pull
-request; tags `v*` build all four targets and publish them with a `SHA256SUMS` file.
+CI runs fmt, clippy, tests and a locked build on Linux, macOS and Windows for every push and pull
+request; tags `v*` build all five targets (Linux and macOS on x86_64 and arm64, Windows on x86_64)
+and publish them with a `SHA256SUMS` file.
 
 To ship builds to your own users with a bundled OAuth client, set both variables at build time;
 `init` then needs no `--client-id`/`--client-secret`. Google treats desktop client secrets as

@@ -101,8 +101,8 @@ Pick the local folder and the Drive folder you want to keep in sync, then:
 dsync init ~/gdrive --remote-folder backups/lab --credentials ~/Downloads/client_secret.json
 ```
 
-`~/gdrive` is created if needed. `backups/lab` is relative to *My Drive* and is created on Drive if
-it doesn't exist. The credentials JSON is read once and its client ID and secret are stored in
+`~/gdrive` is created if needed (on Windows use a path such as `%USERPROFILE%\gdrive`).
+`backups/lab` is relative to *My Drive* and is created on Drive if it doesn't exist. The credentials JSON is read once and its client ID and secret are stored in
 `~/gdrive/.gd/` with mode 0600, so you can delete the download afterwards.
 
 A browser tab opens (the URL is also printed in case it doesn't). Choose the account you added as a

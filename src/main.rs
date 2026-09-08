@@ -262,7 +262,7 @@ fn init(
     if !root.join(config::IGNORE_FILE).exists() {
         std::fs::write(
             root.join(config::IGNORE_FILE),
-            "# gitignore-style patterns for files dsync should not sync\n.DS_Store\n._*\n",
+            "# gitignore-style patterns for files dsync should not sync\n.DS_Store\n._*\nThumbs.db\ndesktop.ini\n",
         )?;
     }
     println!(
@@ -324,7 +324,9 @@ fn real_path(abs: &Path) -> std::path::PathBuf {
         }
         existing.pop();
     }
-    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
+    // `dunce` strips the `\\?\` verbatim prefix Windows would otherwise add, which would not
+    // line up with the workspace root.
+    let mut out = dunce::canonicalize(&existing).unwrap_or(existing);
     for n in missing.into_iter().rev() {
         out.push(n);
     }
@@ -758,7 +760,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("Case Dir")).unwrap();
         std::fs::write(dir.join("Case Dir/x.txt"), b"x").unwrap();
-        let canon = std::fs::canonicalize(&dir).unwrap();
+        let canon = dunce::canonicalize(&dir).unwrap();
         // An existing path comes back in canonical form (symlinked prefixes such as /tmp resolved).
         assert_eq!(
             real_path(&dir.join("Case Dir/x.txt")),
