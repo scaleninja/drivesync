@@ -26,7 +26,7 @@ use std::path::Path;
     version,
     about = "DriveSync: push, pull and diff a local directory against Google Drive",
     long_about = None,
-    after_help = "Home: https://scaleninja.com/drivesync/  Source: https://github.com/scaleninja/drivesync"
+    after_help = "Home:   https://scaleninja.com/drivesync/\nSource: https://github.com/scaleninja/drivesync (MIT)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -56,6 +56,11 @@ struct SyncOpts {
     /// Re-read every file that needs hashing instead of trusting the local hash cache
     #[arg(long)]
     verify: bool,
+    /// After the transfers, remove from the destination whatever no longer exists on the source
+    /// (push: moved to the Drive trash; pull: moved to the Trash on macOS, deleted on Linux).
+    /// Listed in the plan first; skipped entirely if any transfer failed
+    #[arg(long)]
+    delete: bool,
 }
 
 #[derive(Subcommand)]
@@ -424,7 +429,18 @@ fn push(o: &SyncOpts) -> Result<()> {
         bail!("{} does not exist", abs.display());
     }
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
-    let plan = sync::plan_push(&snap.local, &snap.remote, o.force, &snap.collisions);
+    let mut plan = sync::plan_push(&snap.local, &snap.remote, o.force, &snap.collisions);
+    if o.delete {
+        let (deletions, skips) = sync::plan_deletions(
+            &snap.local,
+            &snap.remote,
+            &snap.collisions,
+            sync::Side::Remote,
+        );
+        plan.deletions = deletions;
+        plan.skips.extend(skips);
+        sync::check_deletions(&plan, has_content(&snap.local, &rel))?;
+    }
     if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
         return finish("push", 0, plan.errors.len());
     }
@@ -436,8 +452,8 @@ fn push(o: &SyncOpts) -> Result<()> {
         rel.clone()
     };
     let base_id = ensure_remote_folder(&drive, &cache, &ws, &base_rel)?;
-    let total = plan.actions.len();
-    let failures = sync::exec_push(
+    let mut total = plan.actions.len();
+    let mut failures = sync::exec_push(
         &drive,
         &cache,
         &ws.root,
@@ -446,8 +462,36 @@ fn push(o: &SyncOpts) -> Result<()> {
         &base_id,
         plan.actions,
         o.threads.into(),
-    )?;
-    finish("push", total, failures + plan.errors.len())
+    )? + plan.errors.len();
+    if !plan.deletions.is_empty() {
+        if failures > 0 {
+            skip_deletions(plan.deletions.len(), failures);
+        } else {
+            total += plan.deletions.len();
+            failures += sync::exec_delete_remote(
+                &drive,
+                &cache,
+                &ws.root,
+                &ws.config.remote_folder_id,
+                plan.deletions,
+                o.threads.into(),
+            )?;
+        }
+    }
+    finish("push", total, failures)
+}
+
+/// Whether the source side of `--delete` holds anything besides the selected folder itself.
+fn has_content(side: &Snapshot, rel: &str) -> bool {
+    side.keys().any(|p| p != rel)
+}
+
+/// rsync's rule: deletions are skipped when anything else went wrong, so a partial run can never
+/// remove what it failed to copy.
+fn skip_deletions(planned: usize, failures: usize) {
+    eprintln!(
+        "skipping {planned} deletion(s) because {failures} item(s) failed; re-run once the transfers succeed"
+    );
 }
 
 fn pull(o: &SyncOpts) -> Result<()> {
@@ -468,13 +512,33 @@ fn pull(o: &SyncOpts) -> Result<()> {
             ws.config.remote_folder
         );
     }
-    let plan = sync::plan_pull(&snap.local, &snap.remote, o.force, &snap.collisions);
+    let mut plan = sync::plan_pull(&snap.local, &snap.remote, o.force, &snap.collisions);
+    if o.delete {
+        let (deletions, skips) = sync::plan_deletions(
+            &snap.local,
+            &snap.remote,
+            &snap.collisions,
+            sync::Side::Local,
+        );
+        plan.deletions = deletions;
+        plan.skips.extend(skips);
+        sync::check_deletions(&plan, has_content(&snap.remote, &rel))?;
+    }
     if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
         return finish("pull", 0, plan.errors.len());
     }
-    let total = plan.actions.len();
-    let failures = sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?;
-    finish("pull", total, failures + plan.errors.len())
+    let mut total = plan.actions.len();
+    let mut failures = sync::exec_pull(&drive, &cache, &ws.root, plan.actions, o.threads.into())?
+        + plan.errors.len();
+    if !plan.deletions.is_empty() {
+        if failures > 0 {
+            skip_deletions(plan.deletions.len(), failures);
+        } else {
+            total += plan.deletions.len();
+            failures += sync::exec_delete_local(&ws.root, plan.deletions, &sync::remove_local);
+        }
+    }
+    finish("pull", total, failures)
 }
 
 /// Make sure the folder at workspace path `rel` ("" = the sync root) exists on Drive, creating
@@ -534,6 +598,7 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
         refresh,
         fast,
         verify,
+        delete: false,
     };
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, &opts)?;
     let mut changes = sync::diff(&snap.local, &snap.remote);

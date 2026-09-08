@@ -131,8 +131,9 @@ any unverified app; this is your own client in your own project.
 ![Google hasn't verified this app warning with the Advanced link expanded](7-unverified-app-accept.png)
 
 The consent screen lists the access being granted: *See, edit, create and delete all of your Google
-Drive files*. That is the `auth/drive` scope. `dsync` itself never deletes anything on either side;
-Google's wording describes what the scope permits, not what the tool does. Click **Continue**.
+Drive files*. That is the `auth/drive` scope. Google's wording describes what the scope permits,
+not what the tool does: `dsync` never deletes anything unless you pass `--delete`, and even then
+only after listing every deletion and asking. Click **Continue**.
 
 ![Consent screen with the unverified-app banner and the Drive scope listed](8-allow-unverified-app-oauth.png)
 

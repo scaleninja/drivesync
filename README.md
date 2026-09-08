@@ -92,6 +92,7 @@ Options for `push`, `pull` and `diff`:
 | `--refresh` | Ignore the cached index and re-list the whole remote tree. |
 | `--fast` | rsync-style quick check: equal size and mtime is trusted without reading the file. |
 | `--verify` | Re-read every file that needs hashing instead of trusting the local hash cache. |
+| `--delete` | `push`/`pull` only. After the transfers, remove from the destination whatever no longer exists on the source: `push` moves Drive entries to the Drive trash; `pull` moves local files to the Trash on macOS and deletes them on Linux. Off by default; see [Deleting](#deleting-with---delete). |
 
 Put gitignore-style patterns in `.driveignore` at the sync root to leave things out (`init` creates
 one with `.DS_Store` and `._*`). `.gd/`, symlinks and non-regular files are never synced.
@@ -130,11 +131,14 @@ Modification count 1 src: 12,340 B
 Proceed with the changes? [Y/n]:
 ```
 
-`+` create · `M` overwrite · `!` skipped for a structural reason · `C` conflict · `E` unreadable local file.
+`+` create · `M` overwrite · `!` skipped for a structural reason · `C` conflict · `E` unreadable local file ·
+`D` delete (only with `--delete`).
 
 ## What it will never do
 
-- **Delete anything**, on either side. A file removed locally stays on Drive, and vice versa.
+- **Delete anything**, on either side, unless you ask for it with `--delete`. A file removed locally
+  stays on Drive, and vice versa. See [Deleting](#deleting-with---delete) for what `--delete` does
+  and the guards around it.
 - **Overwrite a conflict** without `--force`, or a name collision (case or Unicode normalization,
   on filesystems that fold them) at all. While conflicts exist the
   prompt defaults to *no*, `--no-prompt` refuses to run, and end-of-input is never taken as *yes*.
@@ -159,13 +163,45 @@ connections are retried with backoff; a push or pull interrupted with Ctrl-C can
 If the remote folder is trashed or deleted on Drive, every command stops and says so. A damaged
 `.gd/cache.db` is rebuilt automatically; it is only an index.
 
+## Deleting with `--delete`
+
+Like `rsync --delete`, `push --delete` and `pull --delete` remove from the destination whatever no
+longer exists on the source, after the transfers. Where things go:
+
+| | Destination | What `--delete` does |
+|---|---|---|
+| `push` | Google Drive | Moves entries to the **Drive trash**, restorable from Drive for a while. |
+| `pull` on macOS | local folder | Moves files to the **Trash** (without Finder's *Put Back* entry; restore by dragging). If the Trash cannot be used, the file stays and the run reports a failure. |
+| `pull` on Linux | local folder | **Deletes permanently.** There is no trash integration on Linux. |
+
+The guards:
+
+- Deletions are listed in the plan as `D` lines with their own count, and the prompt defaults to
+  *no* whenever any are present. `--no-prompt` applies them without asking; passing `--delete` to
+  an unattended run means accepting whatever the plan would remove.
+- An empty source is refused. If the source side holds nothing but the selected folder itself,
+  `--delete` would clear the destination, so the command stops before doing anything.
+- Deletions run last and only if every transfer succeeded. After any failure they are skipped and
+  reported, so a partial run can never remove what it failed to copy.
+- Every deletion is re-checked at the moment it happens. A Drive entry must still have the name,
+  parent, content and modification time the plan saw and a Drive folder must be empty; a local file
+  must still have the size and mtime the plan saw, nothing is followed through a symlink, and a
+  local folder is only removed when empty. Anything that changed in between is left alone and
+  reported.
+- Never deleted: Google Docs, Sheets and Slides, names that collide only by case or Unicode
+  normalization on a case-folding filesystem, anything below a local folder that could not be
+  read, and anything `.driveignore` excludes. A folder that still contains such entries (a
+  `.DS_Store`, a Google Doc, or content beyond the configured depth) is kept and reported as skipped.
+
 ## Known limitations
 
 - Two machines syncing the same Drive folder are not coordinated; there is no three-way merge. The
   Drive API has no conditional update, so the check that a remote file is still what the plan saw
-  and the write that replaces it are two requests; a write from elsewhere in that window is lost.
+  and the write (or, with `--delete`, the trash request) that follows are two requests; a write
+  from elsewhere in that window is lost.
 - Pull keeps no local backup: a local file it overwrites (only ever an older one, unless `--force`)
-  is gone. Push replaces Drive content, which Drive keeps as a revision for a while.
+  is gone; one it removes with `--delete` goes to the Trash on macOS and is deleted on Linux. Push
+  replaces Drive content, which Drive keeps as a revision for a while, and trashes rather than deletes.
 - A full listing holds every My Drive entry in memory while the tree is assembled.
 - Another local process writing to the sync folder at the same moment as `dsync` is outside the
   supported threat model: destinations are checked immediately before each write, but not atomically

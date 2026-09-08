@@ -129,7 +129,7 @@ impl Cache {
         upsert(&self.conn(), path, e)
     }
 
-    #[cfg(test)]
+    /// Drop `path` and everything below it from the index (after a trash on Drive).
     pub fn remove(&self, path: &str) -> Result<()> {
         remove(&self.conn(), path)
     }
@@ -144,7 +144,7 @@ impl Cache {
         path_of_id(&self.conn(), id)
     }
 
-    #[cfg(test)]
+    /// Drive id of the indexed entry at `path`, if any.
     pub fn id_at(&self, path: &str) -> Result<Option<String>> {
         id_at(&self.conn(), path)
     }

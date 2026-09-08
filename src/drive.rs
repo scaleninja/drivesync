@@ -135,6 +135,25 @@ pub trait SessionStore: Sync {
     fn clear(&self, path: &str) -> Result<()>;
 }
 
+/// What a planned trash operation expects to find on Drive; see [`Drive::trash`].
+pub struct TrashExpect<'a> {
+    pub name: &'a str,
+    pub parent_id: &'a str,
+    pub is_dir: bool,
+    pub mtime_ms: i64,
+    pub md5: Option<&'a str>,
+}
+
+/// Outcome of [`Drive::trash`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Trash {
+    Done,
+    /// Already trashed or deleted.
+    Gone,
+    /// A folder that still has live children; left alone.
+    NotEmpty,
+}
+
 /// Time allowed for a request that carries `bytes` of body: a fixed allowance plus a floor
 /// transfer rate of 100 KB/s. A stalled transfer therefore fails and is resumed from the last
 /// byte Drive received rather than hanging forever, while slow links are not cut off.
@@ -384,6 +403,59 @@ impl Drive {
 
     pub fn file_id(&self, alias: &str) -> Result<String> {
         Ok(self.get_file(alias)?.id)
+    }
+
+    /// Move one entry to the trash, but only if it is still exactly what the plan saw: same name,
+    /// still under `parent_id`, same type, and for a file the same content and mtime. A folder
+    /// must have no live children. `Gone` means it was already trashed or deleted by someone
+    /// else, which is the desired end state.
+    pub fn trash(&self, id: &str, expect: &TrashExpect<'_>) -> Result<Trash> {
+        #[derive(Deserialize)]
+        struct Status {
+            #[serde(flatten)]
+            file: File,
+            #[serde(default)]
+            trashed: bool,
+            #[serde(default)]
+            parents: Vec<String>,
+        }
+        let url = format!("{}/{id}", self.api);
+        let s: Status = match self.send(&move |c| {
+            Ok(c.get(&url)
+                .query(&[("fields", format!("{FIELDS},trashed,parents"))]))
+        }) {
+            Ok(r) => r.json()?,
+            Err(e) if is_status(&e, StatusCode::NOT_FOUND) => return Ok(Trash::Gone),
+            Err(e) => return Err(e),
+        };
+        if s.trashed {
+            return Ok(Trash::Gone);
+        }
+        if s.file.name != expect.name || !s.parents.iter().any(|p| p == expect.parent_id) {
+            bail!("remote entry was moved or renamed since the plan was made; re-run to re-plan");
+        }
+        if s.file.is_folder() != expect.is_dir {
+            bail!("remote entry changed type since the plan was made; re-run to re-plan");
+        }
+        if expect.is_dir {
+            if !self.list_children(id)?.is_empty() {
+                return Ok(Trash::NotEmpty);
+            }
+        } else {
+            let now = s.file.to_entry();
+            let md5_changed =
+                matches!((now.md5.as_deref(), expect.md5), (Some(a), Some(b)) if a != b);
+            if md5_changed || (now.mtime_ms - expect.mtime_ms).abs() > 1000 {
+                bail!("remote file changed since the plan was made; re-run to re-plan");
+            }
+        }
+        let url = format!("{}/{id}", self.api);
+        self.send(&move |c| {
+            Ok(c.patch(&url)
+                .query(&[("fields", "id,trashed")])
+                .json(&serde_json::json!({ "trashed": true })))
+        })?;
+        Ok(Trash::Done)
     }
 
     /// Parent ids of `id` if it is still a live (not trashed, not deleted) folder; None otherwise.

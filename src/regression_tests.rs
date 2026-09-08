@@ -513,3 +513,138 @@ fn batched_ancestor_rename_reconciles_child_at_its_current_path() {
     assert!(c.pending_walks().unwrap().is_empty());
     assert_eq!(c.meta("start_page_token").unwrap().as_deref(), Some("next"));
 }
+
+#[test]
+fn remote_deletions_are_verified_before_trashing() {
+    // ROOT holds: OLD (as planned), CHANGED (content differs from the plan), FULL (a folder that
+    // still has a child), EMPTY (an empty folder), GONE (already deleted on Drive) and LOCAL
+    // (reappeared on disk since the plan was made).
+    let patched = Arc::new(Mutex::new(Vec::new()));
+    let seen = patched.clone();
+    let server = Server::start(move |r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/files/OLD") => Reply::json(file("OLD", "old.txt", "ROOT", false)),
+        ("GET", "/files/CHANGED") => {
+            let mut f = file("CHANGED", "changed.txt", "ROOT", false);
+            f["md5Checksum"] = json!("new");
+            Reply::json(f)
+        }
+        ("GET", "/files/FULL") => Reply::json(file("FULL", "full", "ROOT", true)),
+        ("GET", "/files/EMPTY") => Reply::json(file("EMPTY", "empty", "ROOT", true)),
+        ("GET", "/files/GONE") => Reply::status(404),
+        ("GET", "/files/LOCAL") => Reply::json(file("LOCAL", "local.txt", "ROOT", false)),
+        ("GET", "/files") => {
+            let q = r.query("q").unwrap_or_default();
+            let files = if q.contains("'FULL'") {
+                vec![file("CHILD", "child", "FULL", false)]
+            } else {
+                vec![]
+            };
+            Reply::json(json!({ "files": files }))
+        }
+        ("PATCH", path) => {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            assert_eq!(body, json!({ "trashed": true }));
+            seen.lock().unwrap().push(path.to_string());
+            Reply::json(json!({ "id": path.rsplit('/').next().unwrap(), "trashed": true }))
+        }
+        _ => Reply::status(404),
+    });
+    let cache = Cache::open(Path::new(":memory:")).unwrap();
+    let root = Dir::new();
+    std::fs::write(root.0.join("local.txt"), b"back").unwrap();
+    let mut deletions = Vec::new();
+    for (id, name, folder) in [
+        ("OLD", "old.txt", false),
+        ("CHANGED", "changed.txt", false),
+        ("FULL", "full", true),
+        ("EMPTY", "empty", true),
+        ("GONE", "gone.txt", false),
+        ("LOCAL", "local.txt", false),
+    ] {
+        let e = entry(file(id, name, "ROOT", folder));
+        cache.upsert(name, &e).unwrap();
+        deletions.push(sync::Delete::Remote {
+            path: name.into(),
+            id: id.into(),
+            is_dir: folder,
+            mtime_ms: e.mtime_ms,
+            md5: e.md5.clone(),
+        });
+    }
+    cache
+        .upsert("full/child", &entry(file("CHILD", "child", "FULL", false)))
+        .unwrap();
+
+    let failures =
+        sync::exec_delete_remote(&server.drive(), &cache, &root.0, "ROOT", deletions, 4).unwrap();
+    assert_eq!(failures, 1, "only the file whose content changed fails");
+    let mut trashed = patched.lock().unwrap().clone();
+    trashed.sort();
+    assert_eq!(trashed, ["/files/EMPTY", "/files/OLD"]);
+    // The index forgets what is gone from Drive and keeps what was left alone.
+    assert!(cache.entry("old.txt").unwrap().is_none());
+    assert!(cache.entry("empty").unwrap().is_none());
+    assert!(cache.entry("gone.txt").unwrap().is_none());
+    assert!(cache.entry("changed.txt").unwrap().is_some());
+    assert!(cache.entry("full").unwrap().is_some());
+    assert!(cache.entry("full/child").unwrap().is_some());
+    assert!(cache.entry("local.txt").unwrap().is_some());
+    assert!(root.0.join("local.txt").exists());
+}
+
+#[test]
+fn remote_deletions_below_a_moved_folder_are_not_trashed() {
+    // "sub" is indexed under ROOT but Drive now says it lives elsewhere: sub/x.txt is no longer
+    // part of the sync tree and must not be touched, while a top-level file still is.
+    let patched = Arc::new(Mutex::new(Vec::new()));
+    let seen = patched.clone();
+    let server = Server::start(move |r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/files/SUB") => Reply::json(file("SUB", "sub", "ELSEWHERE", true)),
+        ("GET", "/files/TOP") => Reply::json(file("TOP", "top.txt", "ROOT", false)),
+        ("PATCH", path) => {
+            seen.lock().unwrap().push(path.to_string());
+            Reply::json(json!({ "id": "x", "trashed": true }))
+        }
+        _ => Reply::status(404),
+    });
+    let cache = Cache::open(Path::new(":memory:")).unwrap();
+    let root = Dir::new();
+    cache
+        .upsert("sub", &entry(file("SUB", "sub", "ROOT", true)))
+        .unwrap();
+    let x = entry(file("X", "x.txt", "SUB", false));
+    cache.upsert("sub/x.txt", &x).unwrap();
+    let top = entry(file("TOP", "top.txt", "ROOT", false));
+    cache.upsert("top.txt", &top).unwrap();
+    let deletions = vec![
+        sync::Delete::Remote {
+            path: "sub/x.txt".into(),
+            id: "X".into(),
+            is_dir: false,
+            mtime_ms: x.mtime_ms,
+            md5: x.md5.clone(),
+        },
+        sync::Delete::Remote {
+            path: "top.txt".into(),
+            id: "TOP".into(),
+            is_dir: false,
+            mtime_ms: top.mtime_ms,
+            md5: top.md5.clone(),
+        },
+    ];
+    let failures =
+        sync::exec_delete_remote(&server.drive(), &cache, &root.0, "ROOT", deletions, 2).unwrap();
+    assert_eq!(
+        failures, 1,
+        "the entry under the moved folder is reported, not trashed"
+    );
+    assert_eq!(*patched.lock().unwrap(), vec!["/files/TOP".to_string()]);
+    assert!(!server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.path == "/files/X"));
+    assert!(cache.entry("sub/x.txt").unwrap().is_some());
+    assert!(cache.entry("top.txt").unwrap().is_none());
+}

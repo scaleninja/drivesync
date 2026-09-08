@@ -597,6 +597,47 @@ impl Action {
     }
 }
 
+/// One deletion, planned only with `--delete` and executed after every transfer succeeded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Delete {
+    /// Move a Drive entry to the trash (push). Re-verified against what the plan saw.
+    Remote {
+        path: String,
+        id: String,
+        is_dir: bool,
+        mtime_ms: i64,
+        md5: Option<String>,
+    },
+    /// Remove a local entry (pull). `expected` is the (size, mtime) the plan saw for a file.
+    Local {
+        path: String,
+        is_dir: bool,
+        expected: Option<(u64, i64)>,
+    },
+}
+
+impl Delete {
+    pub fn path(&self) -> &str {
+        match self {
+            Delete::Remote { path, .. } | Delete::Local { path, .. } => path,
+        }
+    }
+    pub fn is_dir(&self) -> bool {
+        match self {
+            Delete::Remote { is_dir, .. } | Delete::Local { is_dir, .. } => *is_dir,
+        }
+    }
+}
+
+/// Which side `--delete` removes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Trash on Drive whatever is missing locally (push).
+    Remote,
+    /// Delete locally whatever is missing on Drive (pull).
+    Local,
+}
+
 /// A path that was left alone, with the reason.
 pub type Skip = (String, String);
 
@@ -612,6 +653,8 @@ pub struct Plan {
     pub conflicts: Vec<Skip>,
     /// Local files that could not be read. Never transferred; the command exits non-zero.
     pub errors: Vec<Skip>,
+    /// Entries present only on the destination side, removed after the transfers with `--delete`.
+    pub deletions: Vec<Delete>,
 }
 
 const CASE_COLLISION: &str =
@@ -750,6 +793,89 @@ pub fn plan_pull(
     plan
 }
 
+/// Plan `--delete`: every entry that exists only on the destination side, sorted deepest first so
+/// folders are removed after their contents. Never included: names that collide on a
+/// case-insensitive filesystem (the "missing" file is the same file under another spelling),
+/// Google-native documents, and anything below a local folder that could not be read (its
+/// contents are unknown, not absent). Those are reported as skips.
+pub fn plan_deletions(
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+    collisions: &BTreeSet<String>,
+    on: Side,
+) -> (Vec<Delete>, Vec<Skip>) {
+    let (dst, src) = match on {
+        Side::Remote => (remote, local),
+        Side::Local => (local, remote),
+    };
+    let unreadable: Vec<&str> = local
+        .iter()
+        .filter(|(_, e)| e.unreadable)
+        .map(|(p, _)| p.as_str())
+        .collect();
+    let mut deletions = Vec::new();
+    let mut skips = Vec::new();
+    for (path, e) in dst {
+        if src.contains_key(path) || collisions.contains(path) {
+            continue;
+        }
+        if unreadable
+            .iter()
+            .any(|u| path == u || path.starts_with(&format!("{u}/")))
+        {
+            skips.push((
+                path.clone(),
+                "local folder could not be read; not deleted".into(),
+            ));
+            continue;
+        }
+        match on {
+            Side::Remote => {
+                if e.native_doc {
+                    skips.push((path.clone(), "Google-native document; not trashed".into()));
+                    continue;
+                }
+                let Some(id) = e.id.clone() else { continue };
+                deletions.push(Delete::Remote {
+                    path: path.clone(),
+                    id,
+                    is_dir: e.is_dir,
+                    mtime_ms: e.mtime_ms,
+                    md5: e.md5.clone(),
+                });
+            }
+            Side::Local => deletions.push(Delete::Local {
+                path: path.clone(),
+                is_dir: e.is_dir,
+                expected: e.size.map(|size| (size, e.mtime_ms)),
+            }),
+        }
+    }
+    // Deepest first, so a folder is only ever removed after everything inside it.
+    deletions.sort_by(|a, b| {
+        b.path()
+            .matches('/')
+            .count()
+            .cmp(&a.path().matches('/').count())
+            .then_with(|| a.path().cmp(b.path()))
+    });
+    (deletions, skips)
+}
+
+/// The `--delete` guard, checked before anything is transferred. `source_has_content` is false
+/// when the source side holds nothing but the selected folder itself: syncing an empty source with
+/// `--delete` would clear the destination, which is the classic way to lose everything, so it is
+/// refused outright.
+pub fn check_deletions(plan: &Plan, source_has_content: bool) -> Result<()> {
+    if !plan.deletions.is_empty() && !source_has_content {
+        bail!(
+            "refusing --delete: the source side is empty, so every one of the {} destination entry(ies) would be deleted; remove them by hand if that is really intended",
+            plan.deletions.len()
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Listing: one line per path in the style of odeke-em/drive.
 //   + added   M modified   - remote only   ! skipped   C conflict   E error
@@ -816,6 +942,27 @@ fn action_line(
     }
 }
 
+/// One line per planned deletion.
+fn delete_line(
+    d: &Delete,
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+) -> String {
+    let (path, size, what) = match d {
+        Delete::Remote { path, .. } => (path, remote.get(path), "trash on Drive"),
+        Delete::Local { path, .. } => (path, local.get(path), "delete locally"),
+    };
+    if d.is_dir() {
+        line("D", &format!("{path}/"), what)
+    } else {
+        line(
+            "D",
+            path,
+            &format!("{}, {what}", fmt_size(size.and_then(|e| e.size))),
+        )
+    }
+}
+
 /// Interpret a confirmation answer. `None` is end-of-input (no terminal, `< /dev/null`), which is
 /// never consent.
 pub fn parse_answer(input: Option<&str>, default_yes: bool) -> bool {
@@ -853,6 +1000,9 @@ pub fn confirm(
     for (path, reason) in &plan.errors {
         println!("{}", line("E", path, &format!("error: {reason}")));
     }
+    for d in &plan.deletions {
+        println!("{}", delete_line(d, local, remote));
+    }
     let size_of = |a: &Action| match a {
         Action::Upload { path, .. } => local.get(path).and_then(|e| e.size).unwrap_or(0),
         Action::Download { path, .. } => remote.get(path).and_then(|e| e.size).unwrap_or(0),
@@ -878,6 +1028,34 @@ pub fn confirm(
             fmt_size(Some(mods.iter().map(|a| size_of(a)).sum()))
         );
     }
+    if !plan.deletions.is_empty() {
+        let bytes: u64 = plan
+            .deletions
+            .iter()
+            .map(|d| {
+                let side = match d {
+                    Delete::Remote { .. } => remote,
+                    Delete::Local { .. } => local,
+                };
+                side.get(d.path()).and_then(|e| e.size).unwrap_or(0)
+            })
+            .sum();
+        println!(
+            "Deletion count {} dst: {}",
+            plan.deletions.len(),
+            fmt_size(Some(bytes))
+        );
+        println!(
+            "{}",
+            match plan.deletions[0] {
+                Delete::Remote { .. } =>
+                    "Deletions move Drive entries to the trash (restorable from Drive for a while).",
+                Delete::Local { .. } if LOCAL_TRASH => "Deletions move local files to the Trash.",
+                Delete::Local { .. } =>
+                    "Deletions remove local files permanently; there is no trash on this platform.",
+            }
+        );
+    }
     if !plan.skips.is_empty() {
         println!("Skip count {}", plan.skips.len());
     }
@@ -891,7 +1069,7 @@ pub fn confirm(
             bail!("{} conflict(s); refusing to proceed without a prompt (resolve manually or use --force)", plan.conflicts.len());
         }
     }
-    if plan.actions.is_empty() {
+    if plan.actions.is_empty() && plan.deletions.is_empty() {
         println!(
             "{}",
             if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
@@ -905,13 +1083,19 @@ pub fn confirm(
     if no_prompt {
         return Ok(true);
     }
-    let (question, default_yes) = if plan.conflicts.is_empty() {
-        ("Proceed with the changes? [Y/n]: ", true)
+    // Deletions never happen on a reflexive Enter: the default flips to "no" whenever any exist.
+    let changes = if plan.conflicts.is_empty() {
+        "the changes"
     } else {
-        (
-            "Proceed with the non-conflicting changes only? [y/N]: ",
+        "the non-conflicting changes only"
+    };
+    let (question, default_yes) = match plan.deletions.len() {
+        0 if plan.conflicts.is_empty() => (format!("Proceed with {changes}? [Y/n]: "), true),
+        0 => (format!("Proceed with {changes}? [y/N]: "), false),
+        n => (
+            format!("Proceed with {changes}, including {n} deletion(s)? [y/N]: "),
             false,
-        )
+        ),
     };
     print!("{question}");
     std::io::Write::flush(&mut std::io::stdout())?;
@@ -1150,43 +1334,7 @@ pub fn exec_push(
         Action::Mkdir { path } | Action::Upload { path, .. } => Some(parent_of(path)),
         Action::Download { .. } => None,
     });
-    let to_verify = folders_to_verify(written_into, &|p| id_of(p).is_some());
-    let checks: Vec<(String, String, String)> = to_verify
-        .iter()
-        .filter_map(|p| {
-            let expected = if parent_of(p).is_empty() {
-                root_id.to_string()
-            } else {
-                id_of(parent_of(p))?
-            };
-            Some((p.clone(), id_of(p)?, expected))
-        })
-        .collect();
-    let mut bad: BTreeSet<String> = BTreeSet::new();
-    for (path, ok) in parallel(checks, threads, |(path, id, expected)| {
-        let ok = match drive.live_folder_parents(&id) {
-            Ok(Some(parents)) => parents.contains(&expected),
-            Ok(None) => false,
-            Err(e) => {
-                progress::eprintln(&format!(
-                    "x failed   {}/: could not verify the folder on Drive: {e:#}",
-                    display(&path)
-                ));
-                false
-            }
-        };
-        if !ok {
-            progress::eprintln(&format!(
-                "x failed   {}/: folder was moved, trashed or deleted on Drive since the plan was made; re-run",
-                display(&path)
-            ));
-        }
-        (path, ok)
-    }) {
-        if !ok {
-            bad.insert(path);
-        }
-    }
+    let bad = stale_folders(drive, root_id, &id_of, written_into, threads);
     if !bad.is_empty() {
         // Nothing is written into a bad folder or anything below it.
         folder_ids.retain(|p, _| {
@@ -1373,6 +1521,57 @@ pub fn exec_push(
     Ok(failures + results.into_iter().filter(|failed| *failed).count())
 }
 
+/// Ask Drive whether every indexed folder among `parents` (and each of their ancestors) still
+/// hangs where the index says it does; `id_of` gives a path's indexed folder id. Returns the
+/// paths that were moved, trashed, deleted or could not be checked: nothing below them may be
+/// written to or trashed, since they are no longer part of the sync tree.
+fn stale_folders<'a>(
+    drive: &Drive,
+    root_id: &str,
+    id_of: &dyn Fn(&str) -> Option<String>,
+    parents: impl Iterator<Item = &'a str>,
+    threads: usize,
+) -> BTreeSet<String> {
+    let to_verify = folders_to_verify(parents, &|p| id_of(p).is_some());
+    let checks: Vec<(String, String, String)> = to_verify
+        .iter()
+        .filter_map(|p| {
+            let expected = if parent_of(p).is_empty() {
+                root_id.to_string()
+            } else {
+                id_of(parent_of(p))?
+            };
+            Some((p.clone(), id_of(p)?, expected))
+        })
+        .collect();
+    let mut bad: BTreeSet<String> = BTreeSet::new();
+    for (path, ok) in parallel(checks, threads, |(path, id, expected)| {
+        let ok = match drive.live_folder_parents(&id) {
+            Ok(Some(parents)) => parents.contains(&expected),
+            Ok(None) => false,
+            Err(e) => {
+                progress::eprintln(&format!(
+                    "x failed   {}/: could not verify the folder on Drive: {e:#}",
+                    display(&path)
+                ));
+                false
+            }
+        };
+        if !ok {
+            progress::eprintln(&format!(
+                "x failed   {}/: folder was moved, trashed or deleted on Drive since the plan was made; re-run",
+                display(&path)
+            ));
+        }
+        (path, ok)
+    }) {
+        if !ok {
+            bad.insert(path);
+        }
+    }
+    bad
+}
+
 /// The already-indexed folders (and all their ancestors, up to but excluding the root) that a
 /// set of destination parents refers to. `known` says whether a path is an indexed folder.
 fn folders_to_verify<'a>(
@@ -1475,6 +1674,253 @@ pub fn exec_pull(
     );
     spinner.finish();
     Ok(failures + results.into_iter().filter(|failed| *failed).count())
+}
+
+/// Trash on Drive what a push plan marked for deletion: files first, in parallel, then folders
+/// deepest first. Every entry is re-fetched and must still be what the plan saw (name, parent,
+/// content, type); a folder must be empty; an entry that meanwhile appeared locally is left alone.
+/// Returns the number of failures (skips are not failures).
+pub fn exec_delete_remote(
+    drive: &Drive,
+    cache: &Cache,
+    root: &Path,
+    remote_folder_id: &str,
+    deletions: Vec<Delete>,
+    threads: usize,
+) -> Result<usize> {
+    let total = deletions.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    let parent_id = |path: &str| -> Result<Option<String>> {
+        let parent = parent_of(path);
+        if parent.is_empty() {
+            Ok(Some(remote_folder_id.to_string()))
+        } else {
+            cache.id_at(parent)
+        }
+    };
+    // A folder moved out of the sync tree since the plan takes its contents with it: nothing under
+    // it is ours to trash any more. Every ancestor of every target is checked first, once.
+    let id_of = |p: &str| -> Option<String> {
+        cache
+            .entry(p)
+            .ok()
+            .flatten()
+            .filter(|e| e.is_dir)
+            .and_then(|e| e.id)
+    };
+    let bad = stale_folders(
+        drive,
+        remote_folder_id,
+        &id_of,
+        deletions.iter().map(|d| parent_of(d.path())),
+        threads,
+    );
+    let mut failures = 0;
+    let deletions: Vec<Delete> = deletions
+        .into_iter()
+        .filter(|d| {
+            let under_bad = bad
+                .iter()
+                .any(|b| d.path() == b || d.path().starts_with(&format!("{b}/")));
+            if under_bad {
+                failures += 1;
+            }
+            !under_bad
+        })
+        .collect();
+    // Files at any depth can go in one parallel batch; folders wait for their contents.
+    let mut files = Vec::new();
+    let mut levels: BTreeMap<std::cmp::Reverse<usize>, Vec<Delete>> = BTreeMap::new();
+    for d in deletions {
+        if d.is_dir() {
+            levels
+                .entry(std::cmp::Reverse(d.path().matches('/').count()))
+                .or_default()
+                .push(d);
+        } else {
+            files.push(d);
+        }
+    }
+    let done = AtomicUsize::new(0);
+    let spinner = Spinner::start(&format!("Trashing 0/{total} ({threads} streams)"));
+    for batch in std::iter::once(files).chain(levels.into_values()) {
+        let jobs: Vec<(Delete, String)> = batch
+            .into_iter()
+            .filter_map(|d| match parent_id(d.path()) {
+                Ok(Some(parent)) => Some((d, parent)),
+                Ok(None) => {
+                    progress::eprintln(&format!(
+                        "x failed   {}: parent folder is not in the index; re-run to re-plan",
+                        display(d.path())
+                    ));
+                    failures += 1;
+                    None
+                }
+                Err(e) => {
+                    progress::eprintln(&format!("x failed   {}: {e:#}", display(d.path())));
+                    failures += 1;
+                    None
+                }
+            })
+            .collect();
+        let results = parallel(jobs, threads, |(d, parent)| {
+            let Delete::Remote {
+                path,
+                id,
+                is_dir,
+                mtime_ms,
+                md5,
+            } = &d
+            else {
+                unreachable!()
+            };
+            let shown = if *is_dir {
+                format!("{}/", display(path))
+            } else {
+                display(path)
+            };
+            let result = (|| -> Result<Option<&'static str>> {
+                if std::fs::symlink_metadata(root.join(path)).is_ok() {
+                    return Ok(Some("exists locally now; not trashed, re-run to re-plan"));
+                }
+                let expect = crate::drive::TrashExpect {
+                    name: path.rsplit('/').next().unwrap(),
+                    parent_id: &parent,
+                    is_dir: *is_dir,
+                    mtime_ms: *mtime_ms,
+                    md5: md5.as_deref(),
+                };
+                match drive.trash(id, &expect)? {
+                    crate::drive::Trash::Done | crate::drive::Trash::Gone => {
+                        if let Err(e) = cache.remove(path) {
+                            progress::eprintln(&format!(
+                                "warning: cache update failed for {}: {e:#}",
+                                display(path)
+                            ));
+                        }
+                        Ok(None)
+                    }
+                    crate::drive::Trash::NotEmpty => Ok(Some(
+                        "folder is not empty on Drive (contents beyond the depth limit, Google-native documents, or new files); left in place",
+                    )),
+                }
+            })();
+            match &result {
+                Ok(None) => progress::println(&format!("- trashed  {shown}")),
+                Ok(Some(why)) => progress::println(&format!("! skipped  {shown}  {why}")),
+                Err(e) => progress::eprintln(&format!("x failed   {shown}: {e:#}")),
+            }
+            spinner.set(format!(
+                "Trashing {}/{total} ({threads} streams)",
+                done.fetch_add(1, Ordering::SeqCst) + 1
+            ));
+            result.is_err()
+        });
+        failures += results.into_iter().filter(|failed| *failed).count();
+    }
+    spinner.finish();
+    Ok(failures)
+}
+
+/// Whether `pull --delete` moves local entries to the system trash (macOS) or removes them
+/// outright (everywhere else).
+pub const LOCAL_TRASH: bool = cfg!(target_os = "macos");
+
+/// Remove a local file or (empty) folder. On macOS it goes to the user's Trash through
+/// `NSFileManager`, which needs no Finder automation permission; if the Trash is unavailable the
+/// entry stays, there is no fallback to deletion. On Linux it is deleted permanently.
+pub fn remove_local(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(path)
+            .map_err(|e| anyhow::anyhow!("could not move to the Trash: {e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if std::fs::symlink_metadata(path)?.is_dir() {
+            std::fs::remove_dir(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Remove locally what a pull plan marked for deletion: files first, then folders deepest first,
+/// each handed to `remove` (the system trash in production). A file must still have the size and
+/// mtime the plan saw; nothing is followed through a symlink; a folder is only removed when empty
+/// (ignored files such as `.DS_Store` keep it, reported as a skip). Returns the number of failures.
+pub fn exec_delete_local(
+    root: &Path,
+    deletions: Vec<Delete>,
+    remove: &dyn Fn(&Path) -> Result<()>,
+) -> usize {
+    let mut failures = 0;
+    let (dirs, files): (Vec<Delete>, Vec<Delete>) = deletions.into_iter().partition(Delete::is_dir);
+    for d in files.into_iter().chain(dirs) {
+        let Delete::Local {
+            path,
+            is_dir,
+            expected,
+        } = &d
+        else {
+            unreachable!()
+        };
+        let dest = root.join(path);
+        let shown = if *is_dir {
+            format!("{}/", display(path))
+        } else {
+            display(path)
+        };
+        let result = (|| -> Result<Option<&'static str>> {
+            guard_parents(root, path)?;
+            if *is_dir {
+                match std::fs::symlink_metadata(&dest) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        bail!("is a symlink; refusing to remove it")
+                    }
+                    Ok(m) if !m.is_dir() => bail!("is no longer a folder; re-run to re-plan"),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                }
+                if std::fs::read_dir(&dest)?.next().is_some() {
+                    return Ok(Some(
+                        "folder is not empty (ignored or new files inside); left in place",
+                    ));
+                }
+                remove(&dest)?;
+                return Ok(None);
+            }
+            let Some(expected) = *expected else {
+                bail!("no size and mtime were recorded for it; re-run to re-plan")
+            };
+            match guard_file(&dest, Some(expected)) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("disappeared") => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            remove(&dest)?;
+            Ok(None)
+        })();
+        match &result {
+            Ok(None) => progress::println(&format!(
+                "- {:<8} {shown}",
+                if LOCAL_TRASH { "trashed" } else { "deleted" }
+            )),
+            Ok(Some(why)) => progress::println(&format!("! skipped  {shown}  {why}")),
+            Err(e) => {
+                progress::eprintln(&format!("x failed   {shown}: {e:#}"));
+                failures += 1;
+            }
+        }
+    }
+    failures
 }
 
 #[cfg(test)]
@@ -2513,5 +2959,221 @@ mod tests {
         );
         assert_eq!(rel_path(Path::new("/r"), Path::new("/r")).unwrap(), "");
         assert!(rel_path(Path::new("/r"), Path::new("/other")).is_err());
+    }
+
+    fn remote_entry(id: &str, is_dir: bool, size: u64) -> Entry {
+        Entry {
+            mtime_ms: 1_000_000,
+            size: (!is_dir).then_some(size),
+            md5: (!is_dir).then(|| "m".to_string()),
+            is_dir,
+            id: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deletions_cover_only_the_destination_side_deepest_first() {
+        let mut local = BTreeMap::new();
+        let mut remote = BTreeMap::new();
+        local.insert("keep.txt".to_string(), sized(1_000_000, 3));
+        remote.insert("keep.txt".to_string(), remote_entry("K", false, 3));
+        local.insert("mine.txt".to_string(), sized(1, 10));
+        local.insert("dir".to_string(), e(1, None, true));
+        local.insert("dir/a.txt".to_string(), sized(1, 20));
+        remote.insert("theirs.txt".to_string(), remote_entry("T", false, 30));
+        remote.insert("rdir".to_string(), remote_entry("RD", true, 0));
+        remote.insert("rdir/b.txt".to_string(), remote_entry("RB", false, 40));
+        let mut doc = remote_entry("DOC", false, 0);
+        doc.native_doc = true;
+        remote.insert("doc".to_string(), doc);
+
+        let (push, skips) = plan_deletions(&local, &remote, &none(), Side::Remote);
+        let paths: Vec<&str> = push.iter().map(Delete::path).collect();
+        assert_eq!(paths, ["rdir/b.txt", "rdir", "theirs.txt"]);
+        assert!(
+            matches!(&push[0], Delete::Remote { id, is_dir: false, md5: Some(m), .. } if id == "RB" && m == "m")
+        );
+        assert!(matches!(&push[1], Delete::Remote { is_dir: true, .. }));
+        assert_eq!(skips.len(), 1);
+        assert!(skips[0].0 == "doc" && skips[0].1.contains("Google-native"));
+
+        let (pull, skips) = plan_deletions(&local, &remote, &none(), Side::Local);
+        let paths: Vec<&str> = pull.iter().map(Delete::path).collect();
+        assert_eq!(paths, ["dir/a.txt", "dir", "mine.txt"]);
+        assert!(matches!(
+            &pull[0],
+            Delete::Local {
+                expected: Some((20, 1)),
+                is_dir: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &pull[1],
+            Delete::Local {
+                expected: None,
+                is_dir: true,
+                ..
+            }
+        ));
+        assert!(skips.is_empty());
+
+        // A name that only collides by case is the same file under another spelling: never deleted.
+        let collisions = BTreeSet::from(["theirs.txt".to_string(), "mine.txt".to_string()]);
+        let (push, _) = plan_deletions(&local, &remote, &collisions, Side::Remote);
+        assert!(!push.iter().any(|d| d.path() == "theirs.txt"));
+        let (pull, _) = plan_deletions(&local, &remote, &collisions, Side::Local);
+        assert!(!pull.iter().any(|d| d.path() == "mine.txt"));
+
+        // Below a local folder that could not be read, remote entries are unknown, not absent.
+        local.insert(
+            "locked".to_string(),
+            Entry {
+                is_dir: true,
+                unreadable: true,
+                ..Default::default()
+            },
+        );
+        remote.insert("locked".to_string(), remote_entry("L", true, 0));
+        remote.insert("locked/x.txt".to_string(), remote_entry("LX", false, 5));
+        let (push, skips) = plan_deletions(&local, &remote, &none(), Side::Remote);
+        assert!(!push.iter().any(|d| d.path().starts_with("locked")));
+        assert!(skips
+            .iter()
+            .any(|(p, why)| p == "locked/x.txt" && why.contains("could not be read")));
+    }
+
+    #[test]
+    fn delete_guard_refuses_an_empty_source() {
+        let mut plan = Plan::default();
+        assert!(
+            check_deletions(&plan, false).is_ok(),
+            "nothing planned, nothing to refuse"
+        );
+        plan.deletions.push(Delete::Local {
+            path: "a".into(),
+            is_dir: false,
+            expected: Some((1, 1)),
+        });
+        let err = check_deletions(&plan, false).unwrap_err().to_string();
+        assert!(err.contains("source side is empty"), "{err}");
+        assert!(check_deletions(&plan, true).is_ok());
+    }
+
+    #[test]
+    fn deletion_lines_name_the_side_and_size() {
+        let mut local = BTreeMap::new();
+        let mut remote = BTreeMap::new();
+        remote.insert("a/b.txt".to_string(), remote_entry("B", false, 1234));
+        local.insert("c.txt".to_string(), sized(1, 5));
+        let remote_file = Delete::Remote {
+            path: "a/b.txt".into(),
+            id: "B".into(),
+            is_dir: false,
+            mtime_ms: 0,
+            md5: None,
+        };
+        let remote_dir = Delete::Remote {
+            path: "a".into(),
+            id: "A".into(),
+            is_dir: true,
+            mtime_ms: 0,
+            md5: None,
+        };
+        let local_file = Delete::Local {
+            path: "c.txt".into(),
+            is_dir: false,
+            expected: Some((5, 1)),
+        };
+        assert_eq!(
+            delete_line(&remote_file, &local, &remote),
+            "D a/b.txt  1,234 B, trash on Drive"
+        );
+        assert_eq!(
+            delete_line(&remote_dir, &local, &remote),
+            "D a/  trash on Drive"
+        );
+        assert_eq!(
+            delete_line(&local_file, &local, &remote),
+            "D c.txt  5 B, delete locally"
+        );
+    }
+
+    /// On macOS this touches the real Trash, so it only runs on request: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn remove_local_removes_a_file_and_an_empty_folder() {
+        let dir = std::env::temp_dir().join(format!("dsync_trash_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dsync-trash-probe.txt");
+        std::fs::write(&file, b"probe").unwrap();
+        remove_local(&file).unwrap();
+        assert!(!file.exists());
+        remove_local(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_deletions_verify_each_target_and_leave_folders_with_content() {
+        let root = std::env::temp_dir().join(format!("dsync_delete_local_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("gone.txt"), b"x").unwrap();
+        std::fs::write(root.join("changed.txt"), b"yy").unwrap();
+        std::fs::write(root.join("sub/inner.txt"), b"zzz").unwrap();
+        std::fs::write(root.join("sub/.DS_Store"), b"").unwrap(); // ignored, so not in the plan
+        std::os::unix::fs::symlink(root.join("gone.txt"), root.join("link.txt")).unwrap();
+        let stat = |name: &str| {
+            let m = std::fs::metadata(root.join(name)).unwrap();
+            (m.len(), mtime_ms_of(&m))
+        };
+        let file = |path: &str, expected: Option<(u64, i64)>| Delete::Local {
+            path: path.into(),
+            is_dir: false,
+            expected,
+        };
+        let dir = |path: &str| Delete::Local {
+            path: path.into(),
+            is_dir: true,
+            expected: None,
+        };
+        let (size, mtime) = stat("changed.txt");
+        let deletions = vec![
+            dir("sub"),
+            dir("empty"),
+            dir("never-existed"),
+            file("gone.txt", Some(stat("gone.txt"))),
+            file("sub/inner.txt", Some(stat("sub/inner.txt"))),
+            file("changed.txt", Some((size, mtime + 5000))), // stale plan
+            file("link.txt", Some((1, 0))),                  // symlink, never followed
+        ];
+        // Plain removal stands in for the macOS Trash, which the test must not pollute.
+        let remove = |p: &Path| -> Result<()> {
+            if p.is_dir() {
+                std::fs::remove_dir(p)?;
+            } else {
+                std::fs::remove_file(p)?;
+            }
+            Ok(())
+        };
+        let failures = exec_delete_local(&root, deletions, &remove);
+        assert_eq!(failures, 2, "the stale file and the symlink fail");
+        assert!(!root.join("gone.txt").exists());
+        assert!(!root.join("sub/inner.txt").exists());
+        assert!(!root.join("empty").exists());
+        assert!(root.join("changed.txt").exists(), "stale stat: untouched");
+        assert!(
+            std::fs::symlink_metadata(root.join("link.txt")).is_ok(),
+            "symlink: untouched"
+        );
+        assert!(
+            root.join("sub").is_dir(),
+            "folder with an ignored file is kept"
+        );
+        assert!(root.join("sub/.DS_Store").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
