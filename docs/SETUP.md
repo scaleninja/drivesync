@@ -4,32 +4,35 @@
 project. Nothing is baked into the binary, no quota is shared with anyone else, and you can revoke
 access at any time from your Google account. This walkthrough takes about ten minutes and uses a
 regular `@gmail.com` account (a Google Workspace account works the same way, with one shortcut noted
-in step 4).
+in step 3).
 
 You'll need `dsync` installed (see the [README](../README.md#install)) and a browser signed in to the
 Google account whose Drive you want to sync.
 
-## 1. Create a Cloud project
+## 1. Create a Cloud project and enable the Drive API
 
-Open the [Google Cloud Console](https://console.cloud.google.com/). If this is your first visit,
-accept the terms of service; no billing account is needed for this. Click the project picker at the
-top of the page, choose **New project**, give it any name (the screenshots use *Test-Cloud-Project*),
-and select it once it's created.
+The quickest way is Google's one-page flow, which creates a project and enables the API together:
 
-## 2. Enable the Google Drive API
+<https://console.cloud.google.com/flows/enableapi?apiid=drive.googleapis.com>
 
-Go to **APIs & Services → Library**, search for *Google Drive API*, open it and click **Enable**.
+If this is your first visit to the Cloud Console, accept the terms of service first; no billing
+account is needed. In the flow, pick **Create a project**, give it any name (the screenshots use
+*Test-Cloud-Project*), and click **Next**, then **Enable**.
+
+To do the same by hand instead: open the [Cloud Console](https://console.cloud.google.com/), use
+the project picker at the top to create and select a project, then go to
+**APIs & Services → Library**, search for *Google Drive API*, open it and click **Enable**.
 
 ![Google Drive API product page with the Enable button](1-enable-gdrive-api.png)
 
-## 3. Set up the consent screen (branding)
+## 2. Set up the consent screen (branding)
 
 Go to **Google Auth Platform** (search for it in the top bar, or **APIs & Services → OAuth consent
 screen**). The first visit shows a short *Get started* wizard:
 
 1. **App name**: what you'll see on Google's sign-in screens, e.g. *DriveSync Personal App*.
 2. **User support email**: your address.
-3. **Audience**: choose **External** (see step 4).
+3. **Audience**: choose **External** (see step 3).
 4. **Contact information**: your address again.
 
 The full **Branding** page also has optional fields for a logo, home page, privacy policy, terms of
@@ -38,7 +41,7 @@ if you intend to submit the app for Google's verification.
 
 ![Branding page showing app domain, authorised domains and developer contact fields](2-branding.png)
 
-## 4. Audience: add yourself as a test user, then decide whether to publish
+## 3. Audience: add yourself as a test user, then decide whether to publish
 
 Open **Audience** in the left menu. A new app starts in **Testing** with user type **External**.
 Under **Test users**, click **Add users** and add the Google account you'll sync with. Only listed
@@ -65,7 +68,7 @@ confirm; there's nothing else to fill in. The status changes to **In production*
 > **Make internal** button is enabled. Internal apps skip Testing entirely, never show the
 > unverified warning, and tokens don't expire. Only users in your organisation can sign in.
 
-## 5. (Optional) Declare the Drive scope
+## 4. (Optional) Declare the Drive scope
 
 `dsync` requests the `https://www.googleapis.com/auth/drive` scope at sign-in whether or not you
 declare it here, so this step is optional for a personal app. Declaring it just makes the consent
@@ -75,9 +78,9 @@ screen list what the app can do. If you want to: **Data access → Add or remove
 ![Data access page listing restricted Drive scopes](3-add-scopes.png)
 
 Google flags Drive scopes as *restricted* and says approval is required. That only applies to
-publishing for the general public; for your own use the sign-in screens in step 7 let you through.
+publishing for the general public; for your own use the sign-in screens in step 6 let you through.
 
-## 6. Create the OAuth client and download its JSON
+## 5. Create the OAuth client and download its JSON
 
 Open **Clients** and click **Create client**. Set **Application type** to **Desktop app**, give it a
 name (this one is only shown in the console), and click **Create**.
@@ -90,7 +93,7 @@ e.g. `~/Downloads/client_secret.json`. You can download it again later from the 
 Google treats desktop-app client secrets as non-confidential, but the file still identifies your
 project, so don't commit it to a repository.
 
-## 7. Run `dsync init`
+## 6. Run `dsync init`
 
 Pick the local folder and the Drive folder you want to keep in sync, then:
 
@@ -107,7 +110,7 @@ test user:
 
 ![Google account chooser for DriveSync Personal App](6-dsync-init.png)
 
-What comes next depends on the mode you chose in step 4.
+What comes next depends on the mode you chose in step 3.
 
 ### If the app is in Testing
 
@@ -152,7 +155,7 @@ Then `dsync pull` or `dsync push` as needed. Both show the plan and ask before d
   and the account you chose isn't a test user. Add it under **Audience → Test users**, or publish
   the app.
 - **Asked to run `dsync init` again every week.** The app is still in Testing, so Google expires
-  refresh tokens after 7 days. Click **Publish app** under Audience (step 4).
+  refresh tokens after 7 days. Click **Publish app** under Audience (step 3).
 - **`Google did not return a refresh token`.** You've authorised this client before and Google only
   issues the refresh token once. Go to <https://myaccount.google.com/permissions>, remove the app,
   and run `dsync init` again.
