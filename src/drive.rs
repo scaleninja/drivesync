@@ -114,9 +114,10 @@ pub trait SessionStore: Sync {
 }
 
 /// Time allowed for a request that carries `bytes` of body: a fixed allowance plus a floor
-/// transfer rate. A stalled transfer therefore fails and is resumed rather than hanging forever.
+/// transfer rate of 100 KB/s. A stalled transfer therefore fails and is resumed from the last
+/// byte Drive received rather than hanging forever, while slow links are not cut off.
 pub fn transfer_timeout(bytes: u64) -> Duration {
-    Duration::from_secs(120 + bytes / 200_000)
+    Duration::from_secs(120 + bytes / 100_000)
 }
 
 #[derive(Deserialize)]
