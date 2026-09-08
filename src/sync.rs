@@ -108,6 +108,19 @@ pub fn part_name(name: &str) -> String {
     )
 }
 
+/// Whether `name` is exactly of the form `part_name` produces (`.<short>.<8 hex>.dsync-part`).
+/// Only such files are ever deleted; anything merely ending in the suffix is left alone.
+pub fn is_part_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(PART_SUFFIX))
+    else {
+        return false;
+    };
+    stem.rsplit_once('.')
+        .is_some_and(|(_, hex)| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Delete temp files left under `base` by an interrupted earlier download. Returns how many went.
 pub fn remove_stale_parts(root: &Path, base: &Path) -> usize {
     let mut removed = 0;
@@ -115,10 +128,7 @@ pub fn remove_stale_parts(root: &Path, base: &Path) -> usize {
         .into_iter()
         .filter_entry(|e| !e.file_type().is_symlink() && !is_under_gd(root, e.path()));
     for entry in walker.flatten() {
-        let is_part = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.ends_with(PART_SUFFIX));
+        let is_part = entry.file_name().to_str().is_some_and(is_part_name);
         if is_part && entry.file_type().is_file() && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -1266,6 +1276,7 @@ pub fn exec_push(
                     ));
                 }
                 let _ = cache.set_local_hash(&path, size, mtime_ms, &md5);
+                let _ = cache.clear_upload_session(&path);
                 Ok(f)
             })();
             match &result {
@@ -2326,8 +2337,15 @@ mod tests {
         std::fs::write(dir.join("sub").join(part_name("b.txt")), b"partial").unwrap();
         std::fs::write(dir.join(".gd").join(part_name("c")), b"keep").unwrap();
         std::fs::write(dir.join("a.txt"), b"real").unwrap();
+        std::fs::write(dir.join("mine.dsync-part"), b"user data").unwrap();
         assert_eq!(remove_stale_parts(&dir, &dir), 2);
         assert!(dir.join("a.txt").exists());
+        assert!(
+            dir.join("mine.dsync-part").exists(),
+            "only dsync's own temp names are deleted"
+        );
+        assert!(is_part_name(&part_name("x")) && !is_part_name("mine.dsync-part"));
+        assert!(!is_part_name(".x.zzzzzzzz.dsync-part"));
         assert!(dir.join(".gd").join(part_name("c")).exists());
         assert_eq!(remove_stale_parts(&dir, &dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();

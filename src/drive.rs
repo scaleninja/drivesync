@@ -314,7 +314,8 @@ impl Drive {
             escape(parent_id),
             escape(name)
         ))?;
-        Ok(files.into_iter().next())
+        // Drive's name comparison is not documented as case-sensitive; only an exact match counts.
+        Ok(files.into_iter().find(|f| f.name == name))
     }
 
     /// Metadata of one file (also resolves aliases such as `root`).
