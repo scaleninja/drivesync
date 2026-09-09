@@ -2846,16 +2846,20 @@ mod tests {
     #[test]
     fn names_with_spaces_and_special_chars() {
         let dir = tmpdir("names");
-        let names = [
+        let mut names = vec![
             "My Documents/Q3 report (final).txt",
             "My Documents/sub folder/it's 100%_done.md",
-            "  leading and trailing  /x.txt",
             "ünïcödé 日本語/naïve café.txt",
-            "back\\slash/tab\there.txt",
             "#hash and $dollar/a&b=c.txt",
-            "my logs/should be ignored.log",
         ];
-        for n in names {
+        // Windows forbids control characters in names, treats `\` as a separator and strips
+        // trailing spaces from folder names, so these two only exist on Unix.
+        if cfg!(unix) {
+            names.push("  leading and trailing  /x.txt");
+            names.push("back\\slash/tab\there.txt");
+        }
+        let ignored = "my logs/should be ignored.log";
+        for n in names.iter().chain(std::iter::once(&ignored)) {
             let p = dir.join(n);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, n.as_bytes()).unwrap();
@@ -2863,7 +2867,7 @@ mod tests {
         std::fs::write(dir.join(IGNORE_FILE), "my logs/\n").unwrap();
         let ignore = load_ignore(&dir);
         let local = local_walk(&dir, &dir, -1, &ignore).unwrap();
-        for n in &names[..6] {
+        for n in &names {
             assert!(local.contains_key(*n), "missing {n}");
             assert_eq!(local[*n].size, Some(n.len() as u64));
             assert_eq!(
@@ -2871,7 +2875,7 @@ mod tests {
                 format!("{:x}", md5::compute(n.as_bytes()))
             );
         }
-        assert!(!local.contains_key("my logs/should be ignored.log"));
+        assert!(!local.contains_key(ignored));
         assert!(local["My Documents/sub folder"].is_dir);
         let sub = local_walk(&dir, &dir.join("My Documents/sub folder"), -1, &ignore).unwrap();
         assert_eq!(
