@@ -264,8 +264,19 @@ impl Auth {
                 last = Some(anyhow::anyhow!("token refresh failed ({status}): {body}"));
                 continue;
             }
+            // Google's rule, not ours: an External OAuth app still in "Testing" gets refresh
+            // tokens that expire after seven days. Say so, or an unattended sync that dies a
+            // week after setup looks like a dsync bug.
+            let hint = if body.contains("invalid_grant") {
+                "\nThe refresh token was revoked or has expired. If this happens about a week after \
+                 `dsync init`, the OAuth app is still in Testing: publish it (Google Auth Platform → \
+                 Audience → Publish app), or make it Internal on a Workspace account. \
+                 See docs/SETUP.md."
+            } else {
+                ""
+            };
             bail!(
-                "token refresh failed ({status}): {body}\nRun `dsync init` again to re-authorize."
+                "token refresh failed ({status}): {body}{hint}\nRun `dsync init` again to re-authorize."
             );
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("token refresh failed")))
