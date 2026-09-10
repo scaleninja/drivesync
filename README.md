@@ -20,6 +20,25 @@ dsync push      # upload local changes (shows the plan, asks first)
 dsync pull      # download remote changes
 ```
 
+## Why this?
+
+Compared to general-purpose tools such as rclone, `dsync` is deliberately narrow: one local folder,
+one Drive folder, a single static Rust binary. What it does differently:
+
+- Shows the plan and asks before changing anything; both-sides-changed is a conflict it will not
+  overwrite without `--force`.
+- Never deletes by default. With `--delete`, Drive entries go to the Drive trash and local files to
+  the Trash on macOS or the Recycle Bin on Windows (see [Deleting](#deleting-with---delete)).
+- Repeat runs are cheap: the remote index is kept current through the Drive Changes API instead of
+  re-listing, and local MD5s are cached in a SQLite index keyed by size and mtime, like git.
+- Content is compared by MD5 by default (Drive computes them server-side); `--fast` trusts equal
+  size and mtime like rsync, `--verify` re-hashes every local file instead of trusting the cache.
+- Every transfer is checked against Drive's MD5 after the fact; downloads land in a temp file and
+  are renamed into place only once verified.
+- Parallel transfers and hashing (8 streams by default, up to 64); resumable uploads that survive
+  a restart.
+- `.driveignore` with gitignore syntax, and `git`-style commands run from anywhere in the folder.
+
 ## Install
 
 **Homebrew** (macOS and Linux):
