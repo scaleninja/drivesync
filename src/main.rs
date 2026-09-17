@@ -146,7 +146,12 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
-            let json_requested = std::env::args().any(|a| a == "--json");
+            // Sniffed from the raw arguments (which may not be UTF-8) up to the `--` terminator.
+            // `--help` and `--version` stay plain text: they are for people.
+            let json_requested = std::env::args_os()
+                .skip(1)
+                .take_while(|a| a.as_os_str() != "--")
+                .any(|a| a.as_os_str() == "--json");
             if json_requested && !matches!(e.kind(), DisplayHelp | DisplayVersion) {
                 output::set_json_mode(true);
                 let message = e.to_string();
@@ -473,7 +478,7 @@ fn snapshot(
     }
     let mut local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore)?;
     cache.prune_local_hashes(rel, &local)?;
-    spinner.set(
+    spinner.phase(
         if o.refresh {
             "Listing the remote tree..."
         } else {
@@ -542,16 +547,19 @@ fn push(o: &SyncOpts) -> Result<i32> {
         sync::check_deletions(&plan, has_content(&snap.local, &rel))?;
     }
     if o.dry_run {
-        return Ok(sync::list_plan(&plan, &snap.local, &snap.remote) as i32);
+        let something = sync::list_plan(&plan, &snap.local, &snap.remote);
+        return finish_dry_run("push", &plan, something);
     }
-    if !sync::confirm(
+    match sync::confirm(
         &plan,
         &snap.local,
         &snap.remote,
         o.no_prompt,
         o.skip_conflicts,
     )? {
-        return finish("push", 0, plan.errors.len());
+        sync::Decision::Proceed => {}
+        sync::Decision::Nothing => return finish("push", 0, plan.errors.len()),
+        sync::Decision::Declined => return finish_declined("push"),
     }
     // Folder that will hold the pushed subtree; created on demand (every level recorded in the
     // cache) so the executor can hang the subtree off it.
@@ -653,16 +661,19 @@ fn pull(o: &SyncOpts) -> Result<i32> {
         sync::check_deletions(&plan, has_content(&snap.remote, &rel))?;
     }
     if o.dry_run {
-        return Ok(sync::list_plan(&plan, &snap.local, &snap.remote) as i32);
+        let something = sync::list_plan(&plan, &snap.local, &snap.remote);
+        return finish_dry_run("pull", &plan, something);
     }
-    if !sync::confirm(
+    match sync::confirm(
         &plan,
         &snap.local,
         &snap.remote,
         o.no_prompt,
         o.skip_conflicts,
     )? {
-        return finish("pull", 0, plan.errors.len());
+        sync::Decision::Proceed => {}
+        sync::Decision::Nothing => return finish("pull", 0, plan.errors.len()),
+        sync::Decision::Declined => return finish_declined("pull"),
     }
     let mut total = plan.actions.len();
     let transfer_failures =
@@ -713,6 +724,8 @@ fn ensure_remote_folder(drive: &Drive, cache: &Cache, ws: &Workspace, rel: &str)
     Ok(id)
 }
 
+/// The end of a run. In JSON mode `done` is always the last event and the exit status carries the
+/// verdict (2 when anything failed); in text mode a run with failures ends with a coded error.
 fn finish(verb: &str, total: usize, failures: usize) -> Result<i32> {
     if output::json_mode() {
         output::emit(serde_json::json!({
@@ -721,8 +734,7 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<i32> {
             "changes": total,
             "failures": failures,
         }));
-    } else if failures == 0 && total > 0 {
-        println!("{verb} complete: {total} change(s)");
+        return Ok(if failures > 0 { 2 } else { 0 });
     }
     if failures > 0 {
         return Err(output::coded_with(
@@ -734,7 +746,56 @@ fn finish(verb: &str, total: usize, failures: usize) -> Result<i32> {
             serde_json::json!({ "failures": failures, "total": total + failures }),
         ));
     }
+    if total > 0 {
+        println!("{verb} complete: {total} change(s)");
+    }
     Ok(0)
+}
+
+/// The user answered no: nothing ran, nothing failed.
+fn finish_declined(verb: &str) -> Result<i32> {
+    if output::json_mode() {
+        output::emit(serde_json::json!({
+            "event": "done",
+            "command": verb,
+            "changes": 0,
+            "failures": 0,
+            "declined": true,
+        }));
+    }
+    Ok(0)
+}
+
+/// The end of a dry run: `changes` counts what would be done. Exit status 2 when the plan already
+/// holds failures (local files that could not be read, which the real run reports the same way),
+/// 1 when anything would change, 0 otherwise.
+fn finish_dry_run(verb: &str, plan: &sync::Plan, something: bool) -> Result<i32> {
+    let planned = plan.actions.len() + plan.deletions.len();
+    let errors = plan.errors.len();
+    if output::json_mode() {
+        output::emit(serde_json::json!({
+            "event": "done",
+            "command": verb,
+            "changes": planned,
+            "failures": errors,
+            "dry_run": true,
+        }));
+    } else if errors > 0 {
+        return Err(output::coded_with(
+            output::ErrorCode::TransferFailed,
+            format!(
+                "{verb} dry run: {errors} local file(s) could not be read; the real run would fail"
+            ),
+            serde_json::json!({ "failures": errors, "total": planned + errors }),
+        ));
+    }
+    Ok(if errors > 0 {
+        2
+    } else if something {
+        1
+    } else {
+        0
+    })
 }
 
 fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<i32> {
@@ -862,6 +923,9 @@ fn update_cache(refresh: bool) -> Result<()> {
 
 fn status(check: bool) -> Result<()> {
     let mut ws = Workspace::find()?;
+    // Opening may rewrite a legacy remote-folder alias to the real id, so it happens before the
+    // facts are reported.
+    let drive = if check { Some(open(&mut ws)?) } else { None };
     let c = ws.config.clone();
     let remote = if c.remote_folder.is_empty() {
         "My Drive".to_string()
@@ -968,11 +1032,9 @@ fn status(check: bool) -> Result<()> {
             println!("{line}");
         }
     }
-    if check {
+    if let Some(drive) = drive {
         // One authenticated round trip: refreshes the token if needed (hence the lock), proves
-        // the remote folder is still a live folder, and names the account. Reported after the
-        // local facts, so those are available even when this part fails.
-        let drive = open(&mut ws)?;
+        // the remote folder is still a live folder, and names the account.
         let mut lock = lock(&ws)?;
         let _guard = lock.write()?;
         drive.check_folder(&ws.config.remote_folder_id)?;

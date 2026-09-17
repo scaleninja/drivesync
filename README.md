@@ -121,7 +121,7 @@ Options for `push`, `pull` and `diff`:
 | `--refresh` | Ignore the cached index and re-list the whole remote tree. |
 | `--fast` | rsync-style quick check: equal size and mtime is trusted without reading the file. |
 | `--verify` | Re-read every file that needs hashing instead of trusting the local hash cache. |
-| `--dry-run` | `push`/`pull` only. Print the plan and exit without asking or changing anything; exit status 1 if anything would change, 0 if not. |
+| `--dry-run` | `push`/`pull` only. Print the plan and exit without asking or changing anything; exit status 1 if anything would change, 2 if the plan already holds errors (unreadable local files, which the real run would report), 0 otherwise. |
 | `--skip-conflicts` | `push`/`pull` only. When the plan has conflicts, transfer everything else: with `--no-prompt` instead of refusing, interactively with the usual prompt instead of a "no" default. |
 | `--delete` | `push`/`pull` only. After the transfers, remove from the destination whatever no longer exists on the source: `push` moves Drive entries to the Drive trash; `pull` moves local files to the Trash on macOS or the Recycle Bin on Windows, and deletes them on Linux. Off by default; see [Deleting](#deleting-with---delete). |
 
@@ -137,8 +137,8 @@ mean the same folder. Only one `dsync` command runs in a workspace at a time; a 
 ## Machine-readable output
 
 `--json` (accepted before or after the command) makes every command print one JSON object per line
-on stdout and nothing on stderr, so a GUI or script can follow a run without parsing prose. Each
-object has an `event` field:
+on stdout and nothing on stderr, so a GUI or script can follow a run without parsing prose
+(`--help` and `--version` stay plain text). Each object has an `event` field:
 
 | Event | When | Fields |
 |---|---|---|
@@ -148,11 +148,11 @@ object has an `event` field:
 | `note` | an explanatory line (conflicts, deletions, a retry, a file that changed mid-run) | `text` |
 | `outcome` | nothing to do | `outcome`: `up_to_date`, `nothing_to_transfer`, `in_sync` |
 | `prompt` | `dsync` is waiting for `y`/`n` on stdin | `question`, `default_yes`, `deletions`, `conflicts` |
-| `progress` | bytes moved for one file, at most every 1 MiB or 250 ms | `path`, `bytes`, `total` (null if unknown) |
+| `progress` | bytes moved for one file, at most every 1 MiB or 250 ms, starting at 0 | `path`, `bytes`, `total` (null if unknown). After a retry `bytes` can drop back to what Drive has acknowledged; files of 5 MB or less report 0 and then the full size |
 | `result` | one item finished | `path`, `dir`, `outcome` (`uploaded`, `updated`, `downloaded`, `mkdir`, `trashed`, `deleted`, `gone`, `skipped`, `failed`), `detail` |
-| `done` | the run finished | `command`, `changes`, `failures` |
+| `done` | the run finished; always the last event, with exit status 2 when `failures` > 0 | `command`, `changes`, `failures`; `dry_run: true` when `changes` counts what would be done; `declined: true` after a "no" |
 | `warning` | a non-fatal problem | `message`; some carry `code` (`unreadable`, `unmappable`, `special_file`, `deletions_skipped`) and `path` or `name` |
-| `error` | the run stopped | `code` (below), `message`, plus counts where relevant |
+| `error` | the run stopped before finishing; always the last event | `code` (below), `message`, plus counts where relevant |
 | `diff`, `diff_summary` | `dsync diff` | `change` (`local_only`, `remote_only`, `local_newer`, `remote_newer`, `modified`, `type_mismatch`, `unreadable`, `case_collision`), `path`, `local`, `remote`; then `differ`, `counts` |
 | `status`, `account` | `dsync status` | the same facts as the text form; `--check` follows with `account` (`email`, `name`, `storage_usage`, `storage_limit`, `remote_folder_ok`) |
 | `auth_url`, `initialized` | `dsync init` | `url`; `root`, `remote_folder`, `remote_folder_id` |
@@ -168,7 +168,7 @@ Error codes, present in the `error` event and in brackets at the end of every te
 | `not_workspace` | not inside an initialized folder |
 | `no_credentials` | the folder has no stored credentials; run `dsync init` |
 | `auth_expired` | the refresh token was revoked or expired; run `dsync init` (see the note on *Testing* apps under [Setup](#setup)) |
-| `auth_failed` | any other authorization failure |
+| `auth_failed` | any other authorization failure, including a 401 after a successful token refresh or a 403 about the grant itself (scope removed on the consent screen, API not enabled) |
 | `remote_folder_missing` | the remote folder was deleted, trashed, moved or replaced |
 | `path_invalid` | the path is outside the workspace, reserved, excluded, a symlink, or missing |
 | `conflicts` | `--no-prompt` met conflicts (pass `--skip-conflicts` to transfer the rest) |

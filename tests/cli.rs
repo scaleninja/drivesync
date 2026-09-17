@@ -112,8 +112,39 @@ fn errors_carry_stable_codes_in_both_modes() {
     let usage = dsync(&d, &["push", "--bogus"]);
     assert_eq!(usage.status, 2);
     assert!(usage.stderr.contains("--bogus"));
-    // --help is never an error.
-    assert_eq!(dsync(&d, &["--json", "push", "--help"]).status, 0);
+    // --help is never an error, and stays text.
+    let help = dsync(&d, &["--json", "push", "--help"]);
+    assert_eq!(help.status, 0);
+    assert!(help.stdout.contains("Usage:"));
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_are_usage_errors_not_panics() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = dir("utf8", false);
+    let bad = std::ffi::OsStr::from_bytes(b"\xff");
+    for json in [false, true] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dsync"));
+        cmd.arg("push").arg(bad);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.current_dir(&d).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "json={json}");
+        if json {
+            let line = String::from_utf8_lossy(&out.stdout);
+            let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(v["code"], "usage");
+        } else {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("UTF-8"));
+        }
+    }
+    // A literal `--json` after `--` is a path, not the flag.
+    let out = dsync(&d, &["push", "--", "--json", "--bogus"]);
+    assert_eq!(out.status, 2);
+    assert!(out.stdout.is_empty(), "text mode: {}", out.stdout);
     std::fs::remove_dir_all(&d).unwrap();
 }
 
@@ -156,8 +187,12 @@ fn status_reports_the_workspace_and_push_needs_credentials() {
     let check = dsync(&d, &["--json", "status", "--check"]);
     assert_eq!(check.status, 2);
     let ev = events(&check);
-    assert_eq!(ev[0]["event"], "status", "the local facts come first");
-    assert_eq!(ev[1]["code"], "no_credentials");
+    assert_eq!(
+        ev.len(),
+        1,
+        "credentials are needed before anything is reported"
+    );
+    assert_eq!(ev[0]["code"], "no_credentials");
     let text = dsync(&d, &["push"]);
     assert_eq!(text.status, 2);
     assert!(

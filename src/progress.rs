@@ -74,8 +74,15 @@ impl Spinner {
         Self { stop, msg, handle }
     }
 
+    /// Change the text (per-file counters and the like); silent in JSON mode.
     pub fn set(&self, msg: String) {
         *self.msg.lock().unwrap() = msg;
+    }
+
+    /// A new step of the run under the same spinner: also a `phase` event in JSON mode.
+    pub fn phase(&self, msg: String) {
+        crate::output::phase(&msg);
+        self.set(msg);
     }
 
     /// Stop and erase the spinner.

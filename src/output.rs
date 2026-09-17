@@ -170,9 +170,24 @@ pub fn code_of(e: &anyhow::Error) -> (ErrorCode, Value) {
         }
     }
     for cause in e.chain() {
-        if cause.downcast_ref::<crate::drive::ApiError>().is_some()
-            || cause.downcast_ref::<reqwest::Error>().is_some()
-        {
+        if let Some(api) = cause.downcast_ref::<crate::drive::ApiError>() {
+            // A 401 that survived the token refresh, or a 403 about the grant itself (scope
+            // removed on Google's consent screen, API disabled in the project), is an
+            // authorization problem; other 403s (a file owned by someone else, quota) are not.
+            let auth = api.status.as_u16() == 401
+                || (api.status.as_u16() == 403
+                    && (api.body.contains("insufficientPermissions")
+                        || api.body.contains("accessNotConfigured")));
+            return (
+                if auth {
+                    ErrorCode::AuthFailed
+                } else {
+                    ErrorCode::Api
+                },
+                Value::Null,
+            );
+        }
+        if cause.downcast_ref::<reqwest::Error>().is_some() {
             return (ErrorCode::Api, Value::Null);
         }
         if cause.downcast_ref::<std::io::Error>().is_some()
@@ -218,6 +233,24 @@ mod tests {
             json!({ "failures": 3 }),
         );
         assert_eq!(code_of(&with).1["failures"], 3);
+        let api = |status: u16, body: &str| -> anyhow::Error {
+            crate::drive::ApiError {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: body.into(),
+                retryable: false,
+            }
+            .into()
+        };
+        assert_eq!(code_of(&api(401, "")).0, ErrorCode::AuthFailed);
+        assert_eq!(
+            code_of(&api(403, r#"{"reason":"insufficientPermissions"}"#)).0,
+            ErrorCode::AuthFailed
+        );
+        assert_eq!(
+            code_of(&api(403, r#"{"reason":"insufficientFilePermissions"}"#)).0,
+            ErrorCode::Api
+        );
+        assert_eq!(code_of(&api(500, "")).0, ErrorCode::Api);
         assert_eq!(
             serde_json::to_value(ErrorCode::RemoteFolderMissing).unwrap(),
             "remote_folder_missing"

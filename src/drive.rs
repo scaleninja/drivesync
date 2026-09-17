@@ -245,10 +245,9 @@ struct Meter {
 }
 
 impl Meter {
+    /// Counting starts at `start` (a resumed upload's offset); nothing is reported until bytes
+    /// move, so a request that is rebuilt for a retry does not announce itself twice.
     fn new(cb: Option<ProgressFn>, rel: &str, start: u64, total: Option<u64>) -> Self {
-        if let Some(cb) = &cb {
-            cb(rel, start, total);
-        }
         Self {
             rel: rel.to_string(),
             done: start,
@@ -325,6 +324,12 @@ impl Drive {
     pub fn with_progress(mut self, f: ProgressFn) -> Self {
         self.progress = Some(f);
         self
+    }
+
+    fn report_progress(&self, rel: &str, done: u64, total: Option<u64>) {
+        if let Some(cb) = &self.progress {
+            cb(rel, done, total);
+        }
     }
 
     /// Who is signed in, and how full their Drive is.
@@ -769,6 +774,9 @@ impl Drive {
             .map(|ex| ex.id.clone())
             .or_else(|| new_id.clone())
             .context("upload has no destination id")?;
+        // One start report per file; later reports count what Drive holds plus what is in
+        // flight, so after a retry the number can go back to Drive's acknowledged offset.
+        self.report_progress(rel, 0, Some(size));
         let result = if size > MULTIPART_LIMIT {
             let mut session = saved.unwrap_or_else(|| UploadSession {
                 uri: None,
@@ -784,8 +792,6 @@ impl Drive {
             self.upload_resumable(&start, &meta, size, local, &mut session, rel, sessions)
         } else {
             let data = std::fs::read(local)?;
-            // Sent in one request, so the `result` event is the only other progress signal.
-            drop(Meter::new(self.progress.clone(), rel, 0, Some(size)));
             let boundary = "dsync_boundary_7f3a9c";
             let mut body = Vec::with_capacity(data.len() + 512);
             body.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
@@ -802,10 +808,13 @@ impl Drive {
                     .timeout(timeout)
                     .body(body.clone()))
             };
-            match new_id {
-                None => Ok(self.send(&build)?.json()?), // PATCH of content is idempotent
-                Some(id) => self.create_with_id(&id, &build),
-            }
+            let file: File = match new_id {
+                None => self.send(&build)?.json()?, // PATCH of content is idempotent
+                Some(id) => self.create_with_id(&id, &build)?,
+            };
+            // Sent as one request, so the bytes are only known to have moved once it succeeds.
+            self.report_progress(rel, size, Some(size));
+            Ok(file)
         };
         let file = result?;
         if file.id != expected_id || file.name != name {
@@ -1004,10 +1013,12 @@ impl Drive {
     ) -> Result<()> {
         let url = format!("{}/{id}", self.api);
         let mut resp = self.send(&move |c| Ok(c.get(&url).query(&[("alt", "media")])))?;
+        let total = resp.content_length();
+        self.report_progress(rel, 0, total); // a retried download starts over
         let mut writer = HashWriter {
             inner: open_temp_exclusive(tmp)?,
             ctx: md5::Context::new(),
-            meter: Meter::new(self.progress.clone(), rel, 0, resp.content_length()),
+            meter: Meter::new(self.progress.clone(), rel, 0, total),
         };
         resp.copy_to(&mut writer).context("reading download body")?;
         writer.inner.sync_all()?;
@@ -1274,11 +1285,17 @@ mod tests {
         }
         m.add(10);
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0], ("a/b.txt".to_string(), 0, Some(total)), "start");
+        assert!(
+            seen[0].1 > 0,
+            "constructing a meter reports nothing: {:?}",
+            seen[0]
+        );
+        assert_eq!(seen[0].0, "a/b.txt");
+        assert_eq!(seen[0].2, Some(total));
         assert_eq!(seen.last().unwrap().1, total, "end");
         assert!(
-            seen.len() <= 5,
-            "throttled to start + 3 steps + end, got {}",
+            seen.len() <= 4,
+            "throttled to 3 steps + end, got {}",
             seen.len()
         );
         assert!(seen.windows(2).all(|w| w[0].1 < w[1].1), "monotonic");

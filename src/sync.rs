@@ -363,7 +363,12 @@ pub fn local_walk(
             Ok(rel) => rel,
             Err(e) => {
                 output::err(
-                    json!({ "event": "warning", "code": "unmappable", "message": format!("{e:#}") }),
+                    json!({
+                        "event": "warning",
+                        "code": "unmappable",
+                        "path": entry.path().to_string_lossy(),
+                        "message": format!("{e:#}"),
+                    }),
                     || format!("! skip     {e:#}"),
                 );
                 continue;
@@ -1118,6 +1123,32 @@ pub fn list_plan(
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
 ) -> bool {
+    let something = list_entries(plan, local, remote);
+    if !something {
+        outcome_nothing(plan);
+    }
+    something
+}
+
+/// The "nothing to do" line, once it is certain the run will not stop with an error instead.
+fn outcome_nothing(plan: &Plan) {
+    let (outcome, text) =
+        if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
+            ("up_to_date", "Everything is up to date.")
+        } else {
+            ("nothing_to_transfer", "Nothing to transfer.")
+        };
+    output::out(json!({ "event": "outcome", "outcome": outcome }), || {
+        text.to_string()
+    });
+}
+
+/// Everything `list_plan` prints except the outcome. Returns whether anything would be done.
+fn list_entries(
+    plan: &Plan,
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+) -> bool {
     let is_dir = |path: &str| {
         local
             .get(path)
@@ -1247,33 +1278,32 @@ pub fn list_plan(
         note("Conflicts are never overwritten: both sides differ and the destination is not older, or names collide.");
         note("Resolve them manually (see `dsync diff`), or re-run with --force to overwrite newer/modified files.");
     }
-    let something = !plan.actions.is_empty() || !plan.deletions.is_empty();
-    if !something {
-        let (outcome, text) =
-            if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
-                ("up_to_date", "Everything is up to date.")
-            } else {
-                ("nothing_to_transfer", "Nothing to transfer.")
-            };
-        output::out(json!({ "event": "outcome", "outcome": outcome }), || {
-            text.to_string()
-        });
-    }
-    something
+    !plan.actions.is_empty() || !plan.deletions.is_empty()
+}
+
+/// What [`confirm`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Go ahead with the plan.
+    Proceed,
+    /// There was nothing to do.
+    Nothing,
+    /// The user said no.
+    Declined,
 }
 
 /// Print the plan and ask for confirmation. Conflicts are listed but never transferred; while any
 /// exist the prompt defaults to "no", and `--no-prompt` refuses to proceed unless
-/// `--skip-conflicts` says the rest may go. Returns false if there is nothing to do or the user
-/// declined.
+/// `--skip-conflicts` says the rest may go.
 pub fn confirm(
     plan: &Plan,
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
     no_prompt: bool,
     skip_conflicts: bool,
-) -> Result<bool> {
-    let something = list_plan(plan, local, remote);
+) -> Result<Decision> {
+    let something = list_entries(plan, local, remote);
+    // Refusing comes before any "nothing to do" line: a driver must never read success first.
     if !plan.conflicts.is_empty() && no_prompt && !skip_conflicts {
         return Err(output::coded_with(
             output::ErrorCode::Conflicts,
@@ -1285,10 +1315,11 @@ pub fn confirm(
         ));
     }
     if !something {
-        return Ok(false);
+        outcome_nothing(plan);
+        return Ok(Decision::Nothing);
     }
     if no_prompt {
-        return Ok(true);
+        return Ok(Decision::Proceed);
     }
     // Deletions never happen on a reflexive Enter: the default flips to "no" whenever any exist,
     // as it does while conflicts are being left behind (unless --skip-conflicts acknowledged them).
@@ -1323,10 +1354,13 @@ pub fn confirm(
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut answer = String::new();
     let read = std::io::stdin().read_line(&mut answer)?;
-    Ok(parse_answer(
-        (read > 0).then_some(answer.as_str()),
-        default_yes,
-    ))
+    Ok(
+        if parse_answer((read > 0).then_some(answer.as_str()), default_yes) {
+            Decision::Proceed
+        } else {
+            Decision::Declined
+        },
+    )
 }
 
 /// One line per differing path for `dsync diff`, with both modification times.
@@ -3606,10 +3640,26 @@ mod tests {
             .push(("c.txt".into(), "remote is newer".into()));
         let err = confirm(&plan, &local, &remote, true, false).unwrap_err();
         assert_eq!(output::code_of(&err).0, output::ErrorCode::Conflicts);
-        assert!(confirm(&plan, &local, &remote, true, true).unwrap());
+        assert_eq!(
+            confirm(&plan, &local, &remote, true, true).unwrap(),
+            Decision::Proceed
+        );
+        // Conflicts and nothing else: still refused unattended, and "nothing" once acknowledged.
+        let mut only = Plan::default();
+        only.conflicts
+            .push(("c.txt".into(), "remote is newer".into()));
+        let err = confirm(&only, &local, &remote, true, false).unwrap_err();
+        assert_eq!(output::code_of(&err).0, output::ErrorCode::Conflicts);
+        assert_eq!(
+            confirm(&only, &local, &remote, true, true).unwrap(),
+            Decision::Nothing
+        );
         // Nothing to do at all: no prompt, no error, whatever the flags.
         let empty = Plan::default();
-        assert!(!confirm(&empty, &local, &remote, true, false).unwrap());
+        assert_eq!(
+            confirm(&empty, &local, &remote, true, false).unwrap(),
+            Decision::Nothing
+        );
         assert!(!list_plan(&empty, &local, &remote));
         assert!(list_plan(&plan, &local, &remote));
     }
