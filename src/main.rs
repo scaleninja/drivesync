@@ -6,13 +6,14 @@ mod auth;
 mod cache;
 mod config;
 mod drive;
+mod output;
 mod progress;
 mod sync;
 
 #[cfg(test)]
 mod regression_tests;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use cache::Cache;
 use clap::{Parser, Subcommand};
 use config::{load_json, save_json, Config, Credentials, Workspace, GD_DIR};
@@ -29,6 +30,9 @@ use std::path::Path;
     after_help = "Home:   https://scaleninja.com/drivesync/\nSource: https://github.com/scaleninja/drivesync (MIT)"
 )]
 struct Cli {
+    /// Machine-readable output: one JSON event per line on stdout, nothing on stderr
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -61,6 +65,14 @@ struct SyncOpts {
     /// Listed in the plan first; skipped entirely if any transfer failed
     #[arg(long)]
     delete: bool,
+    /// Print the plan and exit without asking or changing anything (exit status 1 if anything
+    /// would change)
+    #[arg(long)]
+    dry_run: bool,
+    /// When the plan has conflicts, transfer everything else: with --no-prompt instead of
+    /// refusing, interactively with the usual prompt instead of a "no" default
+    #[arg(long)]
+    skip_conflicts: bool,
 }
 
 #[derive(Subcommand)]
@@ -85,13 +97,20 @@ enum Cmd {
         /// Path to a client_secret.json downloaded from Google Cloud Console
         #[arg(long, conflicts_with_all = ["client_id", "client_secret"])]
         credentials: Option<String>,
+        /// Print the authorization URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Upload local changes to Google Drive
     Push(SyncOpts),
     /// Download remote changes from Google Drive
     Pull(SyncOpts),
     /// Show the workspace configuration and cache state
-    Status,
+    Status {
+        /// Also contact Drive: verify the credentials and remote folder, print the account
+        #[arg(long)]
+        check: bool,
+    },
     /// List files that differ between local and remote (exit status 1 if any do)
     Diff {
         /// Relative path to compare (default: current directory)
@@ -123,19 +142,41 @@ enum Cmd {
 fn main() {
     // Every command returns before the process exits, so locks and the cache close cleanly.
     // Exit status: 0 success, 1 `diff` found differences, 2 an error or a failed transfer.
-    let code = match run() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+            let json_requested = std::env::args().any(|a| a == "--json");
+            if json_requested && !matches!(e.kind(), DisplayHelp | DisplayVersion) {
+                output::set_json_mode(true);
+                let message = e.to_string();
+                let message = message
+                    .trim_start_matches("error: ")
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                output::fatal(&output::coded(output::ErrorCode::Usage, message));
+                std::process::exit(2);
+            }
+            e.exit()
+        }
+    };
+    output::set_json_mode(cli.json);
+    let code = match run(cli.cmd) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            output::fatal(&e);
             2
         }
     };
     std::process::exit(code);
 }
 
-/// Runs a command and returns the process exit code (`diff` uses 1 to mean "differences found").
-fn run() -> Result<i32> {
-    match Cli::parse().cmd {
+/// Runs a command and returns the process exit code (`diff` and `--dry-run` use 1 to mean
+/// "differences found" / "changes would be made").
+fn run(cmd: Cmd) -> Result<i32> {
+    match cmd {
         Cmd::Init {
             dir,
             remote_folder,
@@ -143,6 +184,7 @@ fn run() -> Result<i32> {
             client_id,
             client_secret,
             credentials,
+            no_browser,
         } => init(
             &dir,
             &remote_folder,
@@ -150,11 +192,12 @@ fn run() -> Result<i32> {
             client_id,
             client_secret,
             credentials,
+            no_browser,
         )
         .map(|()| 0),
-        Cmd::Push(o) => push(&o).map(|()| 0),
-        Cmd::Pull(o) => pull(&o).map(|()| 0),
-        Cmd::Status => status().map(|()| 0),
+        Cmd::Push(o) => push(&o),
+        Cmd::Pull(o) => pull(&o),
+        Cmd::Status { check } => status(check).map(|()| 0),
         Cmd::UpdateCache { refresh } => update_cache(refresh).map(|()| 0),
         Cmd::Diff {
             path,
@@ -164,9 +207,14 @@ fn run() -> Result<i32> {
             threads,
         } => diff(&path, refresh, fast, verify, threads.into()),
         Cmd::Version => {
-            println!(
-                "dsync {} (https://scaleninja.com/drivesync/)",
-                env!("CARGO_PKG_VERSION")
+            output::out(
+                serde_json::json!({ "event": "version", "version": env!("CARGO_PKG_VERSION") }),
+                || {
+                    format!(
+                        "dsync {} (https://scaleninja.com/drivesync/)",
+                        env!("CARGO_PKG_VERSION")
+                    )
+                },
             );
             Ok(0)
         }
@@ -192,7 +240,9 @@ fn init(
     client_id: Option<String>,
     client_secret: Option<String>,
     credentials: Option<String>,
+    no_browser: bool,
 ) -> Result<()> {
+    use output::ErrorCode::Usage;
     // A client bundled at build time is used only as a whole, never mixed with a partial override.
     let bundled = match (
         option_env!("DSYNC_CLIENT_ID"),
@@ -207,18 +257,24 @@ fn init(
             if v.get("installed").is_none() && v.get("web").is_some() {
                 // A "Web application" client only accepts pre-registered redirect URIs, and the
                 // loopback port here is chosen at run time, so Google would reject the redirect.
-                bail!("{file} is a 'Web application' OAuth client; create one of type 'Desktop app' instead");
+                fail!(Usage, "{file} is a 'Web application' OAuth client; create one of type 'Desktop app' instead");
             }
             let app = v.get("installed").context("client_secret.json has no 'installed' section")?;
             let get = |k: &str| app.get(k).and_then(|x| x.as_str()).map(String::from).with_context(|| format!("client_secret.json missing {k}"));
             (get("client_id")?, get("client_secret")?)
         }
         (None, Some(id), Some(secret)) => (id, secret),
-        (None, None, None) => bundled.context("missing --client-id/--client-secret (or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)")?,
-        _ => bail!("--client-id and --client-secret must be given together"),
+        (None, None, None) => match bundled {
+            Some(pair) => pair,
+            None => fail!(Usage, "missing --client-id/--client-secret (or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, or --credentials client_secret.json)"),
+        },
+        _ => fail!(Usage, "--client-id and --client-secret must be given together"),
     };
     if depth != -1 && depth < 1 {
-        bail!("--depth must be -1 (unlimited) or a positive number of levels");
+        fail!(
+            Usage,
+            "--depth must be -1 (unlimited) or a positive number of levels"
+        );
     }
     let root = sync::absolutize(dir)?;
     let mut config = Config {
@@ -231,9 +287,10 @@ fn init(
 
     // Nothing on disk changes until Google has accepted the authorization.
     let http = http();
-    let creds = auth::Auth::login(&http, &config)?;
+    let creds = auth::Auth::login(&http, &config, no_browser)?;
     if std::fs::symlink_metadata(root.join(GD_DIR)).is_ok_and(|m| m.file_type().is_symlink()) {
-        bail!(
+        fail!(
+            output::ErrorCode::PathInvalid,
             "{} is a symlink; dsync state must be a real directory",
             root.join(GD_DIR).display()
         );
@@ -265,23 +322,48 @@ fn init(
             "# gitignore-style patterns for files dsync should not sync\n.DS_Store\n._*\nThumbs.db\ndesktop.ini\n",
         )?;
     }
-    println!(
-        "Initialized {} <-> My Drive/{} (id {})",
-        root.display(),
-        config.remote_folder,
-        config.remote_folder_id
+    output::out(
+        serde_json::json!({
+            "event": "initialized",
+            "root": root.to_string_lossy(),
+            "remote_folder": config.remote_folder,
+            "remote_folder_id": config.remote_folder_id,
+        }),
+        || {
+            format!(
+                "Initialized {} <-> My Drive/{} (id {})",
+                root.display(),
+                config.remote_folder,
+                config.remote_folder_id
+            )
+        },
     );
     Ok(())
 }
 
 fn open(ws: &mut Workspace) -> Result<Drive> {
     let creds_path = ws.gd("credentials.json");
-    let creds: Credentials = load_json(&creds_path).context("no credentials; run `dsync init`")?;
+    let creds: Credentials = load_json(&creds_path).map_err(|e| {
+        output::coded(
+            output::ErrorCode::NoCredentials,
+            format!("no credentials ({e:#}); run `dsync init`"),
+        )
+    })?;
     let http = http();
-    let drive = Drive::new(
+    let mut drive = Drive::new(
         http.clone(),
         auth::Auth::new(http, ws.config.clone(), creds, creds_path),
     );
+    if output::json_mode() {
+        drive = drive.with_progress(std::sync::Arc::new(|path, bytes, total| {
+            output::emit(serde_json::json!({
+                "event": "progress",
+                "path": path,
+                "bytes": bytes,
+                "total": total,
+            }));
+        }));
+    }
     if ws.config.remote_folder_id == "root" {
         // Older workspaces stored the alias; the Changes feed reports real parent ids.
         ws.config.remote_folder_id = drive.file_id("root")?;
@@ -295,17 +377,20 @@ fn open(ws: &mut Workspace) -> Result<Drive> {
 /// `push Docs` means the folder stored as `docs` and lines up with the remote index rather than
 /// planning a second copy of everything under a differently-cased name.
 fn target(ws: &Workspace, path: &str) -> Result<(std::path::PathBuf, String)> {
+    use output::ErrorCode::PathInvalid;
     let typed = sync::absolutize(path)?;
     if std::fs::symlink_metadata(&typed).is_ok_and(|m| m.file_type().is_symlink()) {
-        bail!(
+        fail!(
+            PathInvalid,
             "{} is a symlink; dsync does not follow symlinks",
             typed.display()
         );
     }
     let abs = real_path(&typed);
-    let rel = sync::rel_path(&ws.root, &abs)?;
+    let rel =
+        sync::rel_path(&ws.root, &abs).map_err(|e| output::coded(PathInvalid, format!("{e:#}")))?;
     if sync::is_reserved(&rel) {
-        bail!("{rel} is reserved for dsync's own state");
+        fail!(PathInvalid, "{rel} is reserved for dsync's own state");
     }
     Ok((abs, rel))
 }
@@ -344,7 +429,10 @@ fn lock(ws: &Workspace) -> Result<fd_lock::RwLock<std::fs::File>> {
         .open(ws.gd("lock"))?;
     let mut lock = fd_lock::RwLock::new(file);
     if lock.try_write().is_err() {
-        eprintln!("waiting for another dsync instance to finish...");
+        output::err(
+            serde_json::json!({ "event": "phase", "message": "waiting for another dsync instance to finish" }),
+            || "waiting for another dsync instance to finish...".to_string(),
+        );
     }
     Ok(lock)
 }
@@ -377,7 +465,11 @@ fn snapshot(
     let ignore = sync::load_ignore(&ws.root);
     if !rel.is_empty() && sync::is_excluded(&ws.root, &ignore, abs) {
         spinner.finish();
-        bail!("{rel} is excluded by {}", config::IGNORE_FILE);
+        fail!(
+            output::ErrorCode::PathInvalid,
+            "{rel} is excluded by {}",
+            config::IGNORE_FILE
+        );
     }
     let mut local = sync::local_walk(&ws.root, abs, ws.config.depth, &ignore)?;
     cache.prune_local_hashes(rel, &local)?;
@@ -420,16 +512,21 @@ fn snapshot(
     })
 }
 
-fn push(o: &SyncOpts) -> Result<()> {
+fn push(o: &SyncOpts) -> Result<i32> {
     let mut ws = Workspace::find()?;
+    // Local checks first: a bad path should not need credentials or the lock to be reported.
+    let (abs, rel) = target(&ws, &o.path)?;
+    if !abs.exists() {
+        fail!(
+            output::ErrorCode::PathInvalid,
+            "{} does not exist",
+            abs.display()
+        );
+    }
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
-    let (abs, rel) = target(&ws, &o.path)?;
-    if !abs.exists() {
-        bail!("{} does not exist", abs.display());
-    }
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
     let mut plan = sync::plan_push(&snap.local, &snap.remote, o.force, &snap.collisions);
     if o.delete {
@@ -444,7 +541,16 @@ fn push(o: &SyncOpts) -> Result<()> {
         plan.skips.extend(skips);
         sync::check_deletions(&plan, has_content(&snap.local, &rel))?;
     }
-    if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
+    if o.dry_run {
+        return Ok(sync::list_plan(&plan, &snap.local, &snap.remote) as i32);
+    }
+    if !sync::confirm(
+        &plan,
+        &snap.local,
+        &snap.remote,
+        o.no_prompt,
+        o.skip_conflicts,
+    )? {
         return finish("push", 0, plan.errors.len());
     }
     // Folder that will hold the pushed subtree; created on demand (every level recorded in the
@@ -497,25 +603,38 @@ fn has_content(side: &Snapshot, rel: &str) -> bool {
 /// what it failed to copy. (Local files that could not be read do not count: they exist on both
 /// sides, and planning already leaves everything below an unreadable folder alone.)
 fn skip_deletions(planned: usize, failures: usize) {
-    eprintln!(
+    let message = format!(
         "skipping {planned} deletion(s) because {failures} transfer(s) failed; re-run once they succeed"
+    );
+    output::err(
+        serde_json::json!({
+            "event": "warning",
+            "code": "deletions_skipped",
+            "planned": planned,
+            "failures": failures,
+            "message": message,
+        }),
+        || message.clone(),
     );
 }
 
-fn pull(o: &SyncOpts) -> Result<()> {
+fn pull(o: &SyncOpts) -> Result<i32> {
     let mut ws = Workspace::find()?;
+    let (abs, rel) = target(&ws, &o.path)?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
-    let (abs, rel) = target(&ws, &o.path)?;
     let stale = sync::remove_stale_parts(&ws.root, &abs);
     if stale > 0 {
-        eprintln!("removed {stale} temp file(s) left by an interrupted download");
+        output::warning(&format!(
+            "removed {stale} temp file(s) left by an interrupted download"
+        ));
     }
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, o)?;
     if snap.remote.is_empty() && !rel.is_empty() {
-        bail!(
+        fail!(
+            output::ErrorCode::PathInvalid,
             "remote path '{rel}' does not exist under My Drive/{}",
             ws.config.remote_folder
         );
@@ -533,7 +652,16 @@ fn pull(o: &SyncOpts) -> Result<()> {
         plan.skips.extend(skips);
         sync::check_deletions(&plan, has_content(&snap.remote, &rel))?;
     }
-    if !sync::confirm(&plan, &snap.local, &snap.remote, o.no_prompt)? {
+    if o.dry_run {
+        return Ok(sync::list_plan(&plan, &snap.local, &snap.remote) as i32);
+    }
+    if !sync::confirm(
+        &plan,
+        &snap.local,
+        &snap.remote,
+        o.no_prompt,
+        o.skip_conflicts,
+    )? {
         return finish("pull", 0, plan.errors.len());
     }
     let mut total = plan.actions.len();
@@ -568,7 +696,10 @@ fn ensure_remote_folder(drive: &Drive, cache: &Cache, ws: &Workspace, rel: &str)
                     .live_folder_parents(&child)?
                     .is_some_and(|parents| parents.contains(&id))
                 {
-                    bail!("remote folder {path} moved, was trashed or deleted; re-run to re-plan");
+                    fail!(
+                        output::ErrorCode::RemoteFolderMissing,
+                        "remote folder {path} moved, was trashed or deleted; re-run to re-plan"
+                    );
                 }
                 child
             }
@@ -582,26 +713,37 @@ fn ensure_remote_folder(drive: &Drive, cache: &Cache, ws: &Workspace, rel: &str)
     Ok(id)
 }
 
-fn finish(verb: &str, total: usize, failures: usize) -> Result<()> {
-    if failures > 0 {
-        bail!(
-            "{verb} finished with {failures} failure(s) out of {} item(s)",
-            total + failures
-        );
-    }
-    if total > 0 {
+fn finish(verb: &str, total: usize, failures: usize) -> Result<i32> {
+    if output::json_mode() {
+        output::emit(serde_json::json!({
+            "event": "done",
+            "command": verb,
+            "changes": total,
+            "failures": failures,
+        }));
+    } else if failures == 0 && total > 0 {
         println!("{verb} complete: {total} change(s)");
     }
-    Ok(())
+    if failures > 0 {
+        return Err(output::coded_with(
+            output::ErrorCode::TransferFailed,
+            format!(
+                "{verb} finished with {failures} failure(s) out of {} item(s)",
+                total + failures
+            ),
+            serde_json::json!({ "failures": failures, "total": total + failures }),
+        ));
+    }
+    Ok(0)
 }
 
 fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> Result<i32> {
     let mut ws = Workspace::find()?;
+    let (abs, rel) = target(&ws, path)?;
     let drive = open(&mut ws)?;
     let mut lock = lock(&ws)?;
     let _guard = lock.write()?;
     let cache = Cache::open_or_rebuild(&ws.gd("cache.db"))?;
-    let (abs, rel) = target(&ws, path)?;
     let opts = SyncOpts {
         path: path.into(),
         force: false,
@@ -611,6 +753,8 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
         fast,
         verify,
         delete: false,
+        dry_run: false,
+        skip_conflicts: false,
     };
     let snap = snapshot(&ws, &drive, &cache, &abs, &rel, &opts)?;
     let mut changes = sync::diff(&snap.local, &snap.remote);
@@ -621,34 +765,60 @@ fn diff(path: &str, refresh: bool, fast: bool, verify: bool, threads: usize) -> 
     }
     changes.sort();
     if changes.is_empty() {
-        println!("local and remote are in sync");
+        output::out(
+            serde_json::json!({ "event": "outcome", "outcome": "in_sync" }),
+            || "local and remote are in sync".to_string(),
+        );
         return Ok(0);
     }
+    let side = |e: Option<&sync::Entry>| {
+        e.map(|e| {
+            serde_json::json!({
+                "dir": e.is_dir,
+                "size": e.size,
+                "mtime_ms": e.mtime_ms,
+                "md5": e.md5,
+            })
+        })
+    };
     let mut counts = BTreeMap::new();
     for (p, change) in &changes {
-        let label = if snap.collisions.contains(p) {
-            "case collision"
+        let collision = snap.collisions.contains(p);
+        let (label, key) = if collision {
+            ("case collision", "case_collision")
         } else {
-            change.label()
+            (change.label(), change.key())
         };
-        if snap.collisions.contains(p) {
-            println!(
-                "{}",
-                sync::line("C", p, "name differs only by case from another entry")
-            );
-        } else {
-            println!(
-                "{}",
-                sync::diff_line(p, *change, snap.local.get(p), snap.remote.get(p))
-            );
-        }
+        output::out(
+            serde_json::json!({
+                "event": "diff",
+                "change": key,
+                "path": p,
+                "local": side(snap.local.get(p)),
+                "remote": side(snap.remote.get(p)),
+            }),
+            || {
+                if collision {
+                    sync::line("C", p, "name differs only by case from another entry")
+                } else {
+                    sync::diff_line(p, *change, snap.local.get(p), snap.remote.get(p))
+                }
+            },
+        );
         *counts.entry(label).or_insert(0usize) += 1;
     }
     let summary: Vec<String> = counts
         .iter()
         .map(|(label, n)| format!("{n} {label}"))
         .collect();
-    println!("{} file(s) differ: {}", changes.len(), summary.join(", "));
+    output::out(
+        serde_json::json!({
+            "event": "diff_summary",
+            "differ": changes.len(),
+            "counts": counts,
+        }),
+        || format!("{} file(s) differ: {}", changes.len(), summary.join(", ")),
+    );
     Ok(1)
 }
 
@@ -672,46 +842,75 @@ fn update_cache(refresh: bool) -> Result<()> {
         refresh,
     )?;
     spinner.finish();
-    println!(
-        "cache updated: {} entries (was {before}), {}",
-        cache.count()?,
-        cache.updated_at()?.unwrap_or_default()
+    let (entries, updated_at) = (cache.count()?, cache.updated_at()?);
+    output::out(
+        serde_json::json!({
+            "event": "cache",
+            "entries": entries,
+            "was": before,
+            "updated_at": updated_at,
+        }),
+        || {
+            format!(
+                "cache updated: {entries} entries (was {before}), {}",
+                updated_at.clone().unwrap_or_default()
+            )
+        },
     );
     Ok(())
 }
 
-fn status() -> Result<()> {
-    let ws = Workspace::find()?;
-    let c = &ws.config;
+fn status(check: bool) -> Result<()> {
+    let mut ws = Workspace::find()?;
+    let c = ws.config.clone();
     let remote = if c.remote_folder.is_empty() {
         "My Drive".to_string()
     } else {
         format!("My Drive/{}", c.remote_folder)
     };
-    println!("Local directory : {}", ws.root.display());
-    println!("Remote folder   : {remote} (id {})", c.remote_folder_id);
-    println!(
-        "Depth           : {}",
-        if c.depth < 0 {
-            "unlimited".to_string()
-        } else {
-            c.depth.to_string()
-        }
-    );
+    let mut lines = vec![
+        format!("Local directory : {}", ws.root.display()),
+        format!("Remote folder   : {remote} (id {})", c.remote_folder_id),
+        format!(
+            "Depth           : {}",
+            if c.depth < 0 {
+                "unlimited".to_string()
+            } else {
+                c.depth.to_string()
+            }
+        ),
+    ];
+    let mut event = serde_json::json!({
+        "event": "status",
+        "root": ws.root.to_string_lossy(),
+        "remote_folder": c.remote_folder,
+        "remote_folder_id": c.remote_folder_id,
+        "remote_display": remote,
+        "depth": (c.depth >= 0).then_some(c.depth),
+    });
     let cache_path = ws.gd("cache.db");
     match Cache::open(&cache_path).and_then(|c| Ok((c.count()?, c.updated_at()?))) {
-        Ok((n, Some(updated))) => println!(
-            "Cache           : {} ({n} entries, updated {updated}, incremental)",
-            cache_path.display()
-        ),
-        Ok((_, None)) => println!(
-            "Cache           : {} (empty; run update-cache, push, pull or diff)",
-            cache_path.display()
-        ),
-        Err(e) => println!(
-            "Cache           : {} (unreadable: {e:#})",
-            cache_path.display()
-        ),
+        Ok((n, Some(updated))) => {
+            lines.push(format!(
+                "Cache           : {} ({n} entries, updated {updated}, incremental)",
+                cache_path.display()
+            ));
+            event["cache"] = serde_json::json!({ "path": cache_path.to_string_lossy(), "entries": n, "updated_at": updated });
+        }
+        Ok((_, None)) => {
+            lines.push(format!(
+                "Cache           : {} (empty; run update-cache, push, pull or diff)",
+                cache_path.display()
+            ));
+            event["cache"] = serde_json::json!({ "path": cache_path.to_string_lossy(), "entries": 0, "updated_at": null });
+        }
+        Err(e) => {
+            lines.push(format!(
+                "Cache           : {} (unreadable: {e:#})",
+                cache_path.display()
+            ));
+            event["cache"] = serde_json::json!({ "path": cache_path.to_string_lossy(), "error": format!("{e:#}") });
+        }
     }
     let ignore = ws.ignore_file();
     match std::fs::read_to_string(&ignore) {
@@ -721,31 +920,89 @@ fn status() -> Result<()> {
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .count();
-            println!("Ignore file     : {} ({n} pattern(s))", ignore.display());
+            lines.push(format!(
+                "Ignore file     : {} ({n} pattern(s))",
+                ignore.display()
+            ));
+            event["ignore_file"] =
+                serde_json::json!({ "path": ignore.to_string_lossy(), "patterns": n });
         }
-        Err(_) => println!("Ignore file     : {} (absent)", ignore.display()),
+        Err(_) => {
+            lines.push(format!("Ignore file     : {} (absent)", ignore.display()));
+            event["ignore_file"] =
+                serde_json::json!({ "path": ignore.to_string_lossy(), "patterns": null });
+        }
     }
-    println!(
+    let folds = case_insensitive_fs(&ws);
+    lines.push(format!(
         "Filesystem      : case-{}",
-        if case_insensitive_fs(&ws) {
+        if folds {
             "insensitive (name collisions are reported as conflicts)"
         } else {
             "sensitive"
         }
-    );
+    ));
+    event["case_insensitive"] = serde_json::json!(folds);
     match load_json::<Credentials>(&ws.gd("credentials.json")) {
         Ok(creds) => {
             let left = creds.expires_at - auth::now();
-            println!(
+            lines.push(format!(
                 "Access token    : {}",
                 if left > 0 {
                     format!("valid for {} min (auto-refreshes)", left / 60)
                 } else {
                     "expired (will refresh on next use)".into()
                 }
-            );
+            ));
+            event["token"] = serde_json::json!({ "expires_in_secs": left.max(0) });
         }
-        Err(_) => println!("Access token    : none (run `dsync init`)"),
+        Err(_) => {
+            lines.push("Access token    : none (run `dsync init`)".to_string());
+            event["token"] = serde_json::Value::Null;
+        }
+    }
+    if output::json_mode() {
+        output::emit(event);
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    if check {
+        // One authenticated round trip: refreshes the token if needed (hence the lock), proves
+        // the remote folder is still a live folder, and names the account. Reported after the
+        // local facts, so those are available even when this part fails.
+        let drive = open(&mut ws)?;
+        let mut lock = lock(&ws)?;
+        let _guard = lock.write()?;
+        drive.check_folder(&ws.config.remote_folder_id)?;
+        let about = drive.about()?;
+        output::out(
+            serde_json::json!({
+                "event": "account",
+                "email": about.email,
+                "name": about.name,
+                "storage_usage": about.storage_usage,
+                "storage_limit": about.storage_limit,
+                "remote_folder_ok": true,
+            }),
+            || {
+                format!(
+                    "Account         : {}{}\nStorage         : {} used{}\nRemote folder   : reachable",
+                    about.email,
+                    about
+                        .name
+                        .as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default(),
+                    sync::fmt_size(about.storage_usage),
+                    about
+                        .storage_limit
+                        .map(|l| format!(" of {}", sync::fmt_size(Some(l))))
+                        .unwrap_or_default()
+                )
+            },
+        );
     }
     Ok(())
 }

@@ -660,3 +660,27 @@ fn remote_deletions_below_a_moved_folder_are_not_trashed() {
     assert!(cache.entry("sub/x.txt").unwrap().is_some());
     assert!(cache.entry("top.txt").unwrap().is_none());
 }
+
+#[test]
+fn about_reports_account_and_storage() {
+    let server = Server::start(|r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/about") => {
+            assert!(r.query("fields").unwrap().contains("emailAddress"));
+            Reply::json(json!({
+                "user": { "emailAddress": "me@example.com", "displayName": "Me" },
+                "storageQuota": { "limit": "16106127360", "usage": "1234" }
+            }))
+        }
+        _ => Reply::status(404),
+    });
+    let about = server.drive().about().unwrap();
+    assert_eq!(
+        about,
+        drive::About {
+            email: "me@example.com".into(),
+            name: Some("Me".into()),
+            storage_limit: Some(16_106_127_360),
+            storage_usage: Some(1234),
+        }
+    );
+}

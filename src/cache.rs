@@ -85,8 +85,8 @@ impl Cache {
         match Self::open(path) {
             Ok(c) => Ok(c),
             Err(e) if is_corruption(&e) => {
-                crate::progress::eprintln(&format!(
-                    "warning: {} is damaged ({e:#}); rebuilding it",
+                crate::output::warning(&format!(
+                    "{} is damaged ({e:#}); rebuilding it",
                     path.display()
                 ));
                 for suffix in ["", "-wal", "-shm"] {
@@ -402,7 +402,9 @@ pub fn refresh(drive: &Drive, cache: &Cache, root_id: &str, depth: i32, full: bo
         let incremental = apply_changes(drive, cache, root_id, depth, &token);
         match incremental {
             Ok(()) => return Ok(()),
-            Err(e) => crate::progress::eprintln(&format!("warning: incremental cache refresh failed ({e:#}); listing the remote tree in full")),
+            Err(e) => crate::output::warning(&format!(
+                "incremental cache refresh failed ({e:#}); listing the remote tree in full"
+            )),
         }
     }
     // Take the token before listing so nothing that happens during the listing is missed.
@@ -564,10 +566,7 @@ fn apply_change(tx: &Connection, ch: Change, root_id: &str, depth: i32) -> Resul
         return drop_old(tx);
     };
     if !crate::sync::valid_name(&f.file.name) {
-        crate::progress::eprintln(&format!(
-            "! skip     remote name {:?} cannot be a local path",
-            f.file.name
-        ));
+        crate::output::unmappable(&f.file.name);
         return drop_old(tx);
     }
     let new_path = join_rel(&parent_path, &f.file.name);

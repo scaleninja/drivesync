@@ -13,11 +13,14 @@
 use crate::cache::Cache;
 use crate::config::{GD_DIR, IGNORE_FILE};
 use crate::drive::Drive;
-use crate::progress::{self, Spinner};
+use crate::output;
+use crate::progress::Spinner;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ignore::gitignore::Gitignore;
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
@@ -53,6 +56,18 @@ pub enum Change {
 }
 
 impl Change {
+    /// Stable identifier for machine-readable output.
+    pub fn key(self) -> &'static str {
+        match self {
+            Change::LocalOnly => "local_only",
+            Change::RemoteOnly => "remote_only",
+            Change::LocalNewer => "local_newer",
+            Change::RemoteNewer => "remote_newer",
+            Change::Modified => "modified",
+            Change::TypeMismatch => "type_mismatch",
+            Change::Unreadable => "unreadable",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Change::LocalOnly => "local only",
@@ -220,7 +235,7 @@ pub fn rel_path(root: &Path, abs: &Path) -> Result<String> {
 pub fn load_ignore(root: &Path) -> Gitignore {
     let (gi, err) = Gitignore::new(root.join(IGNORE_FILE));
     if let Some(e) = err {
-        progress::eprintln(&format!("warning: problem in {IGNORE_FILE}: {e}"));
+        output::warning(&format!("problem in {IGNORE_FILE}: {e}"));
     }
     gi
 }
@@ -318,7 +333,10 @@ pub fn local_walk(
                     return Err(e).with_context(|| format!("reading {}", base.display()));
                 }
                 if let Ok(rel) = rel_path(root, &path) {
-                    progress::eprintln(&format!("error: could not read {}: {e}", display(&rel)));
+                    output::err(
+                        json!({ "event": "warning", "code": "unreadable", "path": rel, "message": e.to_string() }),
+                        || format!("warning: could not read {}: {e}", display(&rel)),
+                    );
                     out.insert(
                         rel,
                         Entry {
@@ -344,16 +362,19 @@ pub fn local_walk(
         let rel = match rel_path(root, entry.path()) {
             Ok(rel) => rel,
             Err(e) => {
-                progress::eprintln(&format!("! skip     {e:#}"));
+                output::err(
+                    json!({ "event": "warning", "code": "unmappable", "message": format!("{e:#}") }),
+                    || format!("! skip     {e:#}"),
+                );
                 continue;
             }
         };
         let ft = meta.file_type();
         if !ft.is_file() && !ft.is_dir() {
-            progress::eprintln(&format!(
-                "! skip     {}  (not a regular file)",
-                display(&rel)
-            ));
+            output::err(
+                json!({ "event": "warning", "code": "special_file", "path": rel, "message": "not a regular file" }),
+                || format!("! skip     {}  (not a regular file)", display(&rel)),
+            );
             continue;
         }
         if is_reserved(&rel) {
@@ -462,8 +483,8 @@ pub fn fill_hashes(
             Some(md5) => Ok(md5),
             None => hash_stable(&root.join(&path), size, mtime_ms).inspect(|md5| {
                 if let Err(e) = cache.set_local_hash(&path, size, mtime_ms, md5) {
-                    progress::eprintln(&format!(
-                        "warning: hash cache update failed for {}: {e:#}",
+                    output::warning(&format!(
+                        "hash cache update failed for {}: {e:#}",
                         display(&path)
                     ));
                 }
@@ -481,7 +502,10 @@ pub fn fill_hashes(
         match r {
             Ok(md5) => entry.md5 = Some(md5),
             Err(e) => {
-                progress::eprintln(&format!("error: could not read {}: {e:#}", display(&path)));
+                output::err(
+                    json!({ "event": "warning", "code": "unreadable", "path": path, "message": format!("{e:#}") }),
+                    || format!("warning: could not read {}: {e:#}", display(&path)),
+                );
                 entry.unreadable = true;
             }
         }
@@ -901,10 +925,14 @@ pub fn plan_deletions(
 /// refused outright.
 pub fn check_deletions(plan: &Plan, source_has_content: bool) -> Result<()> {
     if !plan.deletions.is_empty() && !source_has_content {
-        bail!(
-            "refusing --delete: the source side is empty, so every one of the {} destination entry(ies) would be deleted; remove them by hand if that is really intended",
-            plan.deletions.len()
-        );
+        return Err(output::coded_with(
+            output::ErrorCode::DeleteRefused,
+            format!(
+                "refusing --delete: the source side is empty, so every one of the {} destination entry(ies) would be deleted; remove them by hand if that is really intended",
+                plan.deletions.len()
+            ),
+            json!({ "deletions": plan.deletions.len() }),
+        ));
     }
     Ok(())
 }
@@ -936,36 +964,86 @@ pub fn line(marker: &str, path: &str, note: &str) -> String {
     }
 }
 
-/// One line per planned change. `src` is the side being copied from, `dst` the side overwritten.
-fn action_line(
+/// A planned change or deletion in structured form: marker, workspace path, note, size, folder?
+struct Shown {
+    marker: &'static str,
+    path: String,
+    note: String,
+    size: Option<u64>,
+    dir: bool,
+}
+
+impl Shown {
+    fn human(&self) -> String {
+        let path = if self.dir {
+            format!("{}/", self.path)
+        } else {
+            self.path.clone()
+        };
+        line(self.marker, &path, &self.note)
+    }
+    fn kind(&self) -> &'static str {
+        match self.marker {
+            "+" => "add",
+            "M" => "modify",
+            "D" => "delete",
+            "!" => "skip",
+            "C" => "conflict",
+            "E" => "error",
+            _ => "other",
+        }
+    }
+    fn event(&self) -> serde_json::Value {
+        json!({
+            "event": "plan",
+            "kind": self.kind(),
+            "path": self.path,
+            "dir": self.dir,
+            "size": self.size,
+            "note": self.note,
+        })
+    }
+}
+
+/// One planned change. `src` is the side being copied from, `dst` the side overwritten.
+fn action_parts(
     a: &Action,
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
-) -> String {
+) -> Shown {
     let transfer =
         |path: &str, src: Option<&Entry>, dst: Option<&Entry>, src_name: &str, dst_name: &str| {
-            match (src, dst) {
-                (Some(s), None) => line("+", path, &fmt_size(s.size)),
-                (Some(s), Some(d)) if s.mtime_ms > d.mtime_ms + MTIME_TOLERANCE_MS => line(
+            let (marker, note) = match (src, dst) {
+                (Some(s), None) => ("+", fmt_size(s.size)),
+                (Some(s), Some(d)) if s.mtime_ms > d.mtime_ms + MTIME_TOLERANCE_MS => {
+                    ("M", format!("{}, {src_name} newer", fmt_size(s.size)))
+                }
+                (Some(s), Some(d)) if d.mtime_ms > s.mtime_ms + MTIME_TOLERANCE_MS => (
                     "M",
-                    path,
-                    &format!("{}, {src_name} newer", fmt_size(s.size)),
+                    format!("{}, forced: {dst_name} is newer", fmt_size(s.size)),
                 ),
-                (Some(s), Some(d)) if d.mtime_ms > s.mtime_ms + MTIME_TOLERANCE_MS => line(
+                (Some(s), Some(_)) => (
                     "M",
-                    path,
-                    &format!("{}, forced: {dst_name} is newer", fmt_size(s.size)),
+                    format!("{}, {}", fmt_size(s.size), Change::Modified.label()),
                 ),
-                (Some(s), Some(_)) => line(
-                    "M",
-                    path,
-                    &format!("{}, {}", fmt_size(s.size), Change::Modified.label()),
-                ),
-                (None, _) => line("M", path, ""),
+                (None, _) => ("M", String::new()),
+            };
+            Shown {
+                marker,
+                path: path.to_string(),
+                note,
+                size: src.and_then(|s| s.size),
+                dir: false,
             }
         };
     match a {
-        Action::Mkdir { path } => line("+", &format!("{path}/"), ""),
+        Action::Mkdir { path } => Shown {
+            marker: "+",
+            path: path.clone(),
+            note: String::new(),
+            size: None,
+            dir: true,
+        },
         Action::Upload { path, .. } => {
             transfer(path, local.get(path), remote.get(path), "local", "remote")
         }
@@ -975,25 +1053,46 @@ fn action_line(
     }
 }
 
-/// One line per planned deletion.
+#[cfg(test)]
+fn action_line(
+    a: &Action,
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+) -> String {
+    action_parts(a, local, remote).human()
+}
+
+/// One planned deletion.
+fn delete_parts(
+    d: &Delete,
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+) -> Shown {
+    let (path, size, what) = match d {
+        Delete::Remote { path, .. } => (path, remote.get(path), "trash on Drive"),
+        Delete::Local { path, .. } => (path, local.get(path), "delete locally"),
+    };
+    let size = size.and_then(|e| e.size);
+    Shown {
+        marker: "D",
+        path: path.clone(),
+        note: if d.is_dir() {
+            what.to_string()
+        } else {
+            format!("{}, {what}", fmt_size(size))
+        },
+        size,
+        dir: d.is_dir(),
+    }
+}
+
+#[cfg(test)]
 fn delete_line(
     d: &Delete,
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
 ) -> String {
-    let (path, size, what) = match d {
-        Delete::Remote { path, .. } => (path, remote.get(path), "trash on Drive"),
-        Delete::Local { path, .. } => (path, local.get(path), "delete locally"),
-    };
-    if d.is_dir() {
-        line("D", &format!("{path}/"), what)
-    } else {
-        line(
-            "D",
-            path,
-            &format!("{}, {what}", fmt_size(size.and_then(|e| e.size))),
-        )
-    }
+    delete_parts(d, local, remote).human()
 }
 
 /// Interpret a confirmation answer. `None` is end-of-input (no terminal, `< /dev/null`), which is
@@ -1012,29 +1111,49 @@ pub fn parse_answer(input: Option<&str>, default_yes: bool) -> bool {
     }
 }
 
-/// Print the plan and ask for confirmation. Conflicts are listed but never transferred; while any
-/// exist the prompt defaults to "no", and `--no-prompt` refuses to proceed at all.
-/// Returns false if there is nothing to do or the user declined.
-pub fn confirm(
+/// Print the plan: one line (or `plan` event) per entry, then the counts, notes and, when there is
+/// nothing to do, the outcome. Returns whether anything would be done.
+pub fn list_plan(
     plan: &Plan,
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
-    no_prompt: bool,
-) -> Result<bool> {
+) -> bool {
+    let is_dir = |path: &str| {
+        local
+            .get(path)
+            .or_else(|| remote.get(path))
+            .is_some_and(|e| e.is_dir)
+    };
     for a in &plan.actions {
-        println!("{}", action_line(a, local, remote));
+        let s = action_parts(a, local, remote);
+        output::out(s.event(), || s.human());
     }
-    for (path, reason) in &plan.skips {
-        println!("{}", line("!", path, &format!("skipped: {reason}")));
-    }
-    for (path, reason) in &plan.conflicts {
-        println!("{}", line("C", path, &format!("conflict: {reason}")));
-    }
-    for (path, reason) in &plan.errors {
-        println!("{}", line("E", path, &format!("error: {reason}")));
+    for (marker, items, prefix) in [
+        ("!", &plan.skips, "skipped"),
+        ("C", &plan.conflicts, "conflict"),
+        ("E", &plan.errors, "error"),
+    ] {
+        for (path, reason) in items {
+            let s = Shown {
+                marker,
+                path: path.clone(),
+                note: reason.clone(),
+                size: None,
+                dir: is_dir(path),
+            };
+            output::out(s.event(), || {
+                line(marker, path, &format!("{prefix}: {reason}"))
+            });
+        }
     }
     for d in &plan.deletions {
-        println!("{}", delete_line(d, local, remote));
+        let s = delete_parts(d, local, remote);
+        let mut event = s.event();
+        event["side"] = json!(match d {
+            Delete::Remote { .. } => "remote",
+            Delete::Local { .. } => "local",
+        });
+        output::out(event, || s.human());
     }
     let size_of = |a: &Action| match a {
         Action::Upload { path, .. } => local.get(path).and_then(|e| e.size).unwrap_or(0),
@@ -1047,96 +1166,160 @@ pub fn confirm(
         Action::Download { expected_local, .. } => expected_local.is_none(),
     };
     let (adds, mods): (Vec<_>, Vec<_>) = plan.actions.iter().partition(|a| is_add(a));
-    if !adds.is_empty() {
-        println!(
-            "Addition count {} src: {}",
-            adds.len(),
-            fmt_size(Some(adds.iter().map(|a| size_of(a)).sum()))
-        );
-    }
-    if !mods.is_empty() {
-        println!(
-            "Modification count {} src: {}",
-            mods.len(),
-            fmt_size(Some(mods.iter().map(|a| size_of(a)).sum()))
-        );
-    }
-    if !plan.deletions.is_empty() {
-        let bytes: u64 = plan
-            .deletions
-            .iter()
-            .map(|d| {
-                let side = match d {
-                    Delete::Remote { .. } => remote,
-                    Delete::Local { .. } => local,
-                };
-                side.get(d.path()).and_then(|e| e.size).unwrap_or(0)
-            })
-            .sum();
-        println!(
-            "Deletion count {} dst: {}",
-            plan.deletions.len(),
-            fmt_size(Some(bytes))
-        );
-        println!(
-            "{}",
-            match plan.deletions[0] {
-                Delete::Remote { .. } =>
-                    "Deletions move Drive entries to the trash (restorable from Drive for a while).",
-                Delete::Local { .. } if LOCAL_TRASH => {
-                    if cfg!(target_os = "macos") {
-                        "Deletions move local files to the Trash."
-                    } else {
-                        "Deletions move local files to the Recycle Bin."
-                    }
-                }
-                Delete::Local { .. } =>
-                    "Deletions remove local files permanently; there is no trash on this platform.",
-            }
-        );
-    }
-    if !plan.skips.is_empty() {
-        println!("Skip count {}", plan.skips.len());
-    }
-    if !plan.errors.is_empty() {
-        println!("Error count {}", plan.errors.len());
-    }
-    if !plan.conflicts.is_empty() {
-        println!("Conflict count {}", plan.conflicts.len());
-        println!("Conflicts are never overwritten: both sides differ and the destination is not older, or names collide.\nResolve them manually (see `dsync diff`), or re-run with --force to overwrite newer/modified files.");
-        if no_prompt {
-            bail!("{} conflict(s); refusing to proceed without a prompt (resolve manually or use --force)", plan.conflicts.len());
+    let add_bytes: u64 = adds.iter().map(|a| size_of(a)).sum();
+    let mod_bytes: u64 = mods.iter().map(|a| size_of(a)).sum();
+    let del_bytes: u64 = plan
+        .deletions
+        .iter()
+        .map(|d| {
+            let side = match d {
+                Delete::Remote { .. } => remote,
+                Delete::Local { .. } => local,
+            };
+            side.get(d.path()).and_then(|e| e.size).unwrap_or(0)
+        })
+        .sum();
+    if output::json_mode() {
+        output::emit(json!({
+            "event": "summary",
+            "additions": { "count": adds.len(), "bytes": add_bytes },
+            "modifications": { "count": mods.len(), "bytes": mod_bytes },
+            "deletions": { "count": plan.deletions.len(), "bytes": del_bytes },
+            "skips": plan.skips.len(),
+            "errors": plan.errors.len(),
+            "conflicts": plan.conflicts.len(),
+        }));
+    } else {
+        if !adds.is_empty() {
+            println!(
+                "Addition count {} src: {}",
+                adds.len(),
+                fmt_size(Some(add_bytes))
+            );
+        }
+        if !mods.is_empty() {
+            println!(
+                "Modification count {} src: {}",
+                mods.len(),
+                fmt_size(Some(mod_bytes))
+            );
+        }
+        if !plan.deletions.is_empty() {
+            println!(
+                "Deletion count {} dst: {}",
+                plan.deletions.len(),
+                fmt_size(Some(del_bytes))
+            );
+        }
+        if !plan.skips.is_empty() {
+            println!("Skip count {}", plan.skips.len());
+        }
+        if !plan.errors.is_empty() {
+            println!("Error count {}", plan.errors.len());
+        }
+        if !plan.conflicts.is_empty() {
+            println!("Conflict count {}", plan.conflicts.len());
         }
     }
-    if plan.actions.is_empty() && plan.deletions.is_empty() {
-        println!(
-            "{}",
-            if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
-                "Everything is up to date."
-            } else {
-                "Nothing to transfer."
+    let note = |text: &str| {
+        output::out(json!({ "event": "note", "text": text }), || {
+            text.to_string()
+        })
+    };
+    if let Some(first) = plan.deletions.first() {
+        note(match first {
+            Delete::Remote { .. } => {
+                "Deletions move Drive entries to the trash (restorable from Drive for a while)."
             }
-        );
+            Delete::Local { .. } if LOCAL_TRASH => {
+                if cfg!(target_os = "macos") {
+                    "Deletions move local files to the Trash."
+                } else {
+                    "Deletions move local files to the Recycle Bin."
+                }
+            }
+            Delete::Local { .. } => {
+                "Deletions remove local files permanently; there is no trash on this platform."
+            }
+        });
+    }
+    if !plan.conflicts.is_empty() {
+        note("Conflicts are never overwritten: both sides differ and the destination is not older, or names collide.");
+        note("Resolve them manually (see `dsync diff`), or re-run with --force to overwrite newer/modified files.");
+    }
+    let something = !plan.actions.is_empty() || !plan.deletions.is_empty();
+    if !something {
+        let (outcome, text) =
+            if plan.skips.is_empty() && plan.conflicts.is_empty() && plan.errors.is_empty() {
+                ("up_to_date", "Everything is up to date.")
+            } else {
+                ("nothing_to_transfer", "Nothing to transfer.")
+            };
+        output::out(json!({ "event": "outcome", "outcome": outcome }), || {
+            text.to_string()
+        });
+    }
+    something
+}
+
+/// Print the plan and ask for confirmation. Conflicts are listed but never transferred; while any
+/// exist the prompt defaults to "no", and `--no-prompt` refuses to proceed unless
+/// `--skip-conflicts` says the rest may go. Returns false if there is nothing to do or the user
+/// declined.
+pub fn confirm(
+    plan: &Plan,
+    local: &BTreeMap<String, Entry>,
+    remote: &BTreeMap<String, Entry>,
+    no_prompt: bool,
+    skip_conflicts: bool,
+) -> Result<bool> {
+    let something = list_plan(plan, local, remote);
+    if !plan.conflicts.is_empty() && no_prompt && !skip_conflicts {
+        return Err(output::coded_with(
+            output::ErrorCode::Conflicts,
+            format!(
+                "{} conflict(s); refusing to proceed without a prompt (resolve them, use --force, or pass --skip-conflicts to transfer the rest)",
+                plan.conflicts.len()
+            ),
+            json!({ "conflicts": plan.conflicts.len() }),
+        ));
+    }
+    if !something {
         return Ok(false);
     }
     if no_prompt {
         return Ok(true);
     }
-    // Deletions never happen on a reflexive Enter: the default flips to "no" whenever any exist.
-    let changes = if plan.conflicts.is_empty() {
-        "the changes"
-    } else {
+    // Deletions never happen on a reflexive Enter: the default flips to "no" whenever any exist,
+    // as it does while conflicts are being left behind (unless --skip-conflicts acknowledged them).
+    let conflicts_pending = !plan.conflicts.is_empty() && !skip_conflicts;
+    let changes = if conflicts_pending {
         "the non-conflicting changes only"
+    } else {
+        "the changes"
     };
     let (question, default_yes) = match plan.deletions.len() {
-        0 if plan.conflicts.is_empty() => (format!("Proceed with {changes}? [Y/n]: "), true),
+        0 if !conflicts_pending => (format!("Proceed with {changes}? [Y/n]: "), true),
         0 => (format!("Proceed with {changes}? [y/N]: "), false),
         n => (
             format!("Proceed with {changes}, including {n} deletion(s)? [y/N]: "),
             false,
         ),
     };
-    print!("{question}");
+    if output::json_mode() {
+        output::emit(json!({
+            "event": "prompt",
+            "question": question.trim_end(),
+            "default_yes": default_yes,
+            "deletions": plan.deletions.len(),
+            "conflicts": plan.conflicts.len(),
+        }));
+    } else if std::io::stdin().is_terminal() {
+        print!("{question}");
+    } else {
+        // A pipe cannot see an unterminated line, so end it for the program on the other side.
+        println!("{question}");
+    }
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut answer = String::new();
     let read = std::io::stdin().read_line(&mut answer)?;
@@ -1329,6 +1512,22 @@ impl crate::drive::SessionStore for Sessions<'_> {
     }
 }
 
+/// Report what happened to one planned item: a `result` event, or the classic one-liner.
+fn report(path: &str, dir: bool, outcome: &str, detail: &str, human: String) {
+    let event = json!({
+        "event": "result",
+        "path": path,
+        "dir": dir,
+        "outcome": outcome,
+        "detail": detail,
+    });
+    if outcome == "failed" {
+        output::err(event, || human);
+    } else {
+        output::out(event, || human);
+    }
+}
+
 /// Execute a push plan. Folders are created level by level, each level in parallel; then file
 /// uploads run in parallel. Every completed action is recorded in the cache immediately, so a
 /// cancelled push resumes cleanly. `base_rel` is the pushed subtree's root ("" for the workspace
@@ -1388,9 +1587,13 @@ pub fn exec_push(
     for a in actions {
         match a {
             // The subtree root itself was created by the caller before execution began.
-            Action::Mkdir { path } if path == base_rel => {
-                progress::println(&format!("+ mkdir    {}/", display(&path)))
-            }
+            Action::Mkdir { path } if path == base_rel => report(
+                &path,
+                true,
+                "mkdir",
+                "",
+                format!("+ mkdir    {}/", display(&path)),
+            ),
             Action::Mkdir { path } => levels
                 .entry(path.matches('/').count())
                 .or_default()
@@ -1415,10 +1618,16 @@ pub fn exec_push(
                 match folder_ids.get(parent_of(&path)) {
                     Some(parent_id) => batch.push((path, parent_id.clone())),
                     None => {
-                        progress::eprintln(&format!(
-                            "x failed   {}/: parent folder is not available on Drive",
-                            display(&path)
-                        ));
+                        report(
+                            &path,
+                            true,
+                            "failed",
+                            "parent folder is not available on Drive",
+                            format!(
+                                "x failed   {}/: parent folder is not available on Drive",
+                                display(&path)
+                            ),
+                        );
                         failures += 1;
                     }
                 }
@@ -1431,14 +1640,26 @@ pub fn exec_push(
                 match &result {
                     Ok(f) => {
                         if let Err(e) = cache.upsert(&path, &f.to_entry()) {
-                            progress::eprintln(&format!(
-                                "warning: cache update failed for {}: {e:#}",
+                            output::warning(&format!(
+                                "cache update failed for {}: {e:#}",
                                 display(&path)
                             ));
                         }
-                        progress::println(&format!("+ mkdir    {}/", display(&path)));
+                        report(
+                            &path,
+                            true,
+                            "mkdir",
+                            "",
+                            format!("+ mkdir    {}/", display(&path)),
+                        );
                     }
-                    Err(e) => progress::eprintln(&format!("x failed   {}/: {e:#}", display(&path))),
+                    Err(e) => report(
+                        &path,
+                        true,
+                        "failed",
+                        &format!("{e:#}"),
+                        format!("x failed   {}/: {e:#}", display(&path)),
+                    ),
                 }
                 spinner.set(format!(
                     "Creating folders {}/{total_dirs} ({threads} streams)",
@@ -1464,10 +1685,16 @@ pub fn exec_push(
         match folder_ids.get(parent_of(&path)) {
             Some(parent_id) => jobs.push((path, parent_id.clone(), existing, mtime_ms)),
             None => {
-                progress::eprintln(&format!(
-                    "x failed   {}: parent folder is not available on Drive",
-                    display(&path)
-                ));
+                report(
+                    &path,
+                    false,
+                    "failed",
+                    "parent folder is not available on Drive",
+                    format!(
+                        "x failed   {}: parent folder is not available on Drive",
+                        display(&path)
+                    ),
+                );
                 failures += 1;
             }
         }
@@ -1489,10 +1716,13 @@ pub fn exec_push(
                 }
                 let (size, mtime_ms) = (meta.len(), mtime_ms_of(&meta));
                 if mtime_ms != planned_mtime {
-                    progress::eprintln(&format!(
-                        "note: {} changed since the plan was made; uploading its current content",
+                    let text = format!(
+                        "{} changed since the plan was made; uploading its current content",
                         display(&path)
-                    ));
+                    );
+                    output::err(json!({ "event": "note", "text": text }), || {
+                        format!("note: {text}")
+                    });
                 }
                 // Fresh bytes bind resumed sessions even when an editor preserves size and mtime.
                 let md5 = hash_stable(&local_path, size, mtime_ms)?;
@@ -1522,14 +1752,14 @@ pub fn exec_push(
                         bail!("checksum mismatch after upload (local {md5}, Drive {remote}); re-run to push it again")
                     }
                     Some(_) => {}
-                    None => progress::eprintln(&format!(
-                        "warning: {} was uploaded but Drive returned no checksum, so it could not be verified",
+                    None => output::warning(&format!(
+                        "{} was uploaded but Drive returned no checksum, so it could not be verified",
                         display(&path)
                     )),
                 }
                 if let Err(e) = cache.upsert(&path, &f.to_entry()) {
-                    progress::eprintln(&format!(
-                        "warning: cache update failed for {}: {e:#}",
+                    output::warning(&format!(
+                        "cache update failed for {}: {e:#}",
                         display(&path)
                     ));
                 }
@@ -1538,16 +1768,27 @@ pub fn exec_push(
                 Ok(f)
             })();
             match &result {
-                Ok(_) => progress::println(&format!(
-                    "^ {:<8} {}",
-                    if existing.is_some() {
+                Ok(_) => {
+                    let verb = if existing.is_some() {
                         "updated"
                     } else {
                         "uploaded"
-                    },
-                    display(&path)
-                )),
-                Err(e) => progress::eprintln(&format!("x failed   {}: {e:#}", display(&path))),
+                    };
+                    report(
+                        &path,
+                        false,
+                        verb,
+                        "",
+                        format!("^ {verb:<8} {}", display(&path)),
+                    );
+                }
+                Err(e) => report(
+                    &path,
+                    false,
+                    "failed",
+                    &format!("{e:#}"),
+                    format!("x failed   {}: {e:#}", display(&path)),
+                ),
             }
             spinner.set(format!(
                 "Uploading {}/{total} ({threads} streams)",
@@ -1589,18 +1830,30 @@ fn stale_folders<'a>(
             Ok(Some(parents)) => parents.contains(&expected),
             Ok(None) => false,
             Err(e) => {
-                progress::eprintln(&format!(
-                    "x failed   {}/: could not verify the folder on Drive: {e:#}",
-                    display(&path)
-                ));
+                report(
+                    &path,
+                    true,
+                    "failed",
+                    &format!("could not verify the folder on Drive: {e:#}"),
+                    format!(
+                        "x failed   {}/: could not verify the folder on Drive: {e:#}",
+                        display(&path)
+                    ),
+                );
                 false
             }
         };
         if !ok {
-            progress::eprintln(&format!(
-                "x failed   {}/: folder was moved, trashed or deleted on Drive since the plan was made; re-run",
-                display(&path)
-            ));
+            report(
+                &path,
+                true,
+                "failed",
+                "folder was moved, trashed or deleted on Drive since the plan was made; re-run",
+                format!(
+                    "x failed   {}/: folder was moved, trashed or deleted on Drive since the plan was made; re-run",
+                    display(&path)
+                ),
+            );
         }
         (path, ok)
     }) {
@@ -1660,9 +1913,21 @@ pub fn exec_pull(
                     Ok(())
                 })();
                 match result {
-                    Ok(()) => progress::println(&format!("+ mkdir    {}/", display(&path))),
+                    Ok(()) => report(
+                        &path,
+                        true,
+                        "mkdir",
+                        "",
+                        format!("+ mkdir    {}/", display(&path)),
+                    ),
                     Err(e) => {
-                        progress::eprintln(&format!("x failed   {}/: {e:#}", display(&path)));
+                        report(
+                            &path,
+                            true,
+                            "failed",
+                            &format!("{e:#}"),
+                            format!("x failed   {}/: {e:#}", display(&path)),
+                        );
                         failures += 1;
                     }
                 }
@@ -1691,7 +1956,7 @@ pub fn exec_pull(
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let tmp = drive.download_to_temp(&id, &dest, md5.as_deref())?;
+                let tmp = drive.download_to_temp(&id, &dest, md5.as_deref(), &path)?;
                 finalize_download(&tmp, &dest, expected_local, mtime_ms)?;
                 if let (Some(md5), Ok(meta)) = (&md5, std::fs::symlink_metadata(&dest)) {
                     // Keyed by the stat the filesystem actually kept (coarser timestamps on
@@ -1701,8 +1966,20 @@ pub fn exec_pull(
                 Ok(())
             })();
             match &result {
-                Ok(()) => progress::println(&format!("v downloaded {}", display(&path))),
-                Err(e) => progress::eprintln(&format!("x failed   {}: {e:#}", display(&path))),
+                Ok(()) => report(
+                    &path,
+                    false,
+                    "downloaded",
+                    "",
+                    format!("v downloaded {}", display(&path)),
+                ),
+                Err(e) => report(
+                    &path,
+                    false,
+                    "failed",
+                    &format!("{e:#}"),
+                    format!("x failed   {}: {e:#}", display(&path)),
+                ),
             }
             spinner.set(format!(
                 "Downloading {}/{total} ({threads} streams)",
@@ -1791,15 +2068,27 @@ pub fn exec_delete_remote(
             .filter_map(|d| match parent_id(d.path()) {
                 Ok(Some(parent)) => Some((d, parent)),
                 Ok(None) => {
-                    progress::eprintln(&format!(
-                        "x failed   {}: parent folder is not in the index; re-run to re-plan",
-                        display(d.path())
-                    ));
+                    report(
+                        d.path(),
+                        d.is_dir(),
+                        "failed",
+                        "parent folder is not in the index; re-run to re-plan",
+                        format!(
+                            "x failed   {}: parent folder is not in the index; re-run to re-plan",
+                            display(d.path())
+                        ),
+                    );
                     failures += 1;
                     None
                 }
                 Err(e) => {
-                    progress::eprintln(&format!("x failed   {}: {e:#}", display(d.path())));
+                    report(
+                        d.path(),
+                        d.is_dir(),
+                        "failed",
+                        &format!("{e:#}"),
+                        format!("x failed   {}: {e:#}", display(d.path())),
+                    );
                     failures += 1;
                     None
                 }
@@ -1852,24 +2141,41 @@ pub fn exec_delete_remote(
                     }
                 };
                 if let Err(e) = cache.remove_and_rescan_parent(path, remote_folder_id) {
-                    progress::eprintln(&format!(
-                        "warning: cache update failed for {}: {e:#}",
-                        display(path)
-                    ));
+                    output::warning(&format!("cache update failed for {}: {e:#}", display(path)));
                 }
                 Ok(outcome)
             })();
             match &result {
-                Ok(Outcome::Done) => progress::println(&format!("- trashed  {shown}")),
+                Ok(Outcome::Done) => {
+                    report(path, *is_dir, "trashed", "", format!("- trashed  {shown}"))
+                }
                 Ok(Outcome::Gone) => {
                     skipped.fetch_add(1, Ordering::SeqCst);
-                    progress::println(&format!("- gone     {shown}  already removed on Drive"));
+                    report(
+                        path,
+                        *is_dir,
+                        "gone",
+                        "already removed on Drive",
+                        format!("- gone     {shown}  already removed on Drive"),
+                    );
                 }
                 Ok(Outcome::Skipped(why)) => {
                     skipped.fetch_add(1, Ordering::SeqCst);
-                    progress::println(&format!("! skipped  {shown}  {why}"));
+                    report(
+                        path,
+                        *is_dir,
+                        "skipped",
+                        why,
+                        format!("! skipped  {shown}  {why}"),
+                    );
                 }
-                Err(e) => progress::eprintln(&format!("x failed   {shown}: {e:#}")),
+                Err(e) => report(
+                    path,
+                    *is_dir,
+                    "failed",
+                    &format!("{e:#}"),
+                    format!("x failed   {shown}: {e:#}"),
+                ),
             }
             spinner.set(format!(
                 "Trashing {}/{total} ({threads} streams)",
@@ -1989,20 +2295,38 @@ pub fn exec_delete_local(
             Ok(Outcome::Done)
         })();
         match &result {
-            Ok(Outcome::Done) => progress::println(&format!(
-                "- {:<8} {shown}",
-                if LOCAL_TRASH { "trashed" } else { "deleted" }
-            )),
+            Ok(Outcome::Done) => {
+                let verb = if LOCAL_TRASH { "trashed" } else { "deleted" };
+                report(path, *is_dir, verb, "", format!("- {verb:<8} {shown}"));
+            }
             Ok(Outcome::Gone) => {
                 tally.skipped += 1;
-                progress::println(&format!("- gone     {shown}  already removed"));
+                report(
+                    path,
+                    *is_dir,
+                    "gone",
+                    "already removed",
+                    format!("- gone     {shown}  already removed"),
+                );
             }
             Ok(Outcome::Skipped(why)) => {
                 tally.skipped += 1;
-                progress::println(&format!("! skipped  {shown}  {why}"));
+                report(
+                    path,
+                    *is_dir,
+                    "skipped",
+                    why,
+                    format!("! skipped  {shown}  {why}"),
+                );
             }
             Err(e) => {
-                progress::eprintln(&format!("x failed   {shown}: {e:#}"));
+                report(
+                    path,
+                    *is_dir,
+                    "failed",
+                    &format!("{e:#}"),
+                    format!("x failed   {shown}: {e:#}"),
+                );
                 tally.failed += 1;
             }
         }
@@ -3209,6 +3533,85 @@ mod tests {
         let err = check_deletions(&plan, false).unwrap_err().to_string();
         assert!(err.contains("source side is empty"), "{err}");
         assert!(check_deletions(&plan, true).is_ok());
+    }
+
+    #[test]
+    fn plan_events_carry_kind_path_dir_size_and_note() {
+        let mut local = BTreeMap::new();
+        let mut remote = BTreeMap::new();
+        local.insert("docs".to_string(), e(1, None, true));
+        local.insert("docs/a.txt".to_string(), sized(5_000, 1234));
+        remote.insert("docs/a.txt".to_string(), remote_entry("A", false, 1000));
+        let mkdir = action_parts(
+            &Action::Mkdir {
+                path: "docs".into(),
+            },
+            &local,
+            &remote,
+        );
+        assert_eq!(
+            mkdir.event(),
+            json!({ "event": "plan", "kind": "add", "path": "docs", "dir": true, "size": null, "note": "" })
+        );
+        assert_eq!(mkdir.human(), "+ docs/");
+        let up = action_parts(
+            &Action::Upload {
+                path: "docs/a.txt".into(),
+                existing: Some(Existing {
+                    id: "A".into(),
+                    mtime_ms: 1_000_000,
+                    md5: None,
+                }),
+                mtime_ms: 5_000,
+            },
+            &local,
+            &remote,
+        );
+        assert_eq!(up.event()["kind"], "modify");
+        assert_eq!(up.event()["size"], 1234);
+        assert_eq!(up.event()["dir"], false);
+        assert_eq!(up.human(), "M docs/a.txt  1,234 B, forced: remote is newer");
+        let del = delete_parts(
+            &Delete::Remote {
+                path: "docs/a.txt".into(),
+                id: "A".into(),
+                is_dir: false,
+                mtime_ms: 0,
+                md5: None,
+            },
+            &local,
+            &remote,
+        );
+        assert_eq!(del.event()["kind"], "delete");
+        assert_eq!(del.event()["size"], 1000);
+        // A path with two spaces inside is unambiguous in the event, unlike the text line.
+        let odd = Shown {
+            marker: "+",
+            path: "a  b.txt".into(),
+            note: "9 B".into(),
+            size: Some(9),
+            dir: false,
+        };
+        assert_eq!(odd.human(), "+ a  b.txt  9 B");
+        assert_eq!(odd.event()["path"], "a  b.txt");
+    }
+
+    #[test]
+    fn unattended_runs_refuse_conflicts_unless_told_to_skip_them() {
+        let local = BTreeMap::new();
+        let remote = BTreeMap::new();
+        let mut plan = Plan::default();
+        plan.actions.push(Action::Mkdir { path: "d".into() });
+        plan.conflicts
+            .push(("c.txt".into(), "remote is newer".into()));
+        let err = confirm(&plan, &local, &remote, true, false).unwrap_err();
+        assert_eq!(output::code_of(&err).0, output::ErrorCode::Conflicts);
+        assert!(confirm(&plan, &local, &remote, true, true).unwrap());
+        // Nothing to do at all: no prompt, no error, whatever the flags.
+        let empty = Plan::default();
+        assert!(!confirm(&empty, &local, &remote, true, false).unwrap());
+        assert!(!list_plan(&empty, &local, &remote));
+        assert!(list_plan(&plan, &local, &remote));
     }
 
     #[test]

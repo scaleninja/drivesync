@@ -58,7 +58,10 @@ impl Workspace {
                 }
             }
             if !dir.pop() {
-                bail!("not inside a dsync workspace (no .gd directory found); run `dsync init`");
+                crate::fail!(
+                    crate::output::ErrorCode::NotWorkspace,
+                    "not inside a dsync workspace (no .gd directory found); run `dsync init`"
+                );
             }
         }
     }

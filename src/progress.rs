@@ -44,11 +44,13 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    /// Start spinning with `msg`; does nothing visible when stderr is not a terminal.
+    /// Start spinning with `msg`; does nothing visible when stderr is not a terminal. In
+    /// JSON mode the message goes out as a `phase` event instead.
     pub fn start(msg: &str) -> Self {
+        crate::output::phase(msg);
         let stop = Arc::new(AtomicBool::new(false));
         let msg = Arc::new(Mutex::new(msg.to_string()));
-        let handle = std::io::stderr().is_terminal().then(|| {
+        let handle = (std::io::stderr().is_terminal() && !crate::output::json_mode()).then(|| {
             let (stop, msg) = (stop.clone(), msg.clone());
             std::thread::spawn(move || {
                 let mut i = 0;

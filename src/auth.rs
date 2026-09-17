@@ -4,7 +4,7 @@
 
 //! OAuth2 installed-app flow (loopback redirect, PKCE) and access-token refresh.
 use crate::config::{save_json, Config, Credentials};
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::io::{Read, Write};
@@ -96,8 +96,9 @@ impl Auth {
         self.creds.expires_at - now()
     }
 
-    /// Interactive browser login. Returns credentials including a refresh token.
-    pub fn login(http: &Client, config: &Config) -> Result<Credentials> {
+    /// Interactive browser login. Returns credentials including a refresh token. With
+    /// `no_browser` the URL is only printed (or emitted as an `auth_url` event).
+    pub fn login(http: &Client, config: &Config, no_browser: bool) -> Result<Credentials> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let state = base64url(&random_bytes::<16>()?);
@@ -109,23 +110,28 @@ impl Auth {
             urlencoding::encode(SCOPE),
             pkce_challenge(&verifier)
         );
-        println!(
-            "Authorize this app by visiting:\n\n  {url}\n\nWaiting for the browser redirect..."
+        crate::output::out(
+            serde_json::json!({ "event": "auth_url", "url": url }),
+            || {
+                format!("Authorize this app by visiting:\n\n  {url}\n\nWaiting for the browser redirect...")
+            },
         );
-        // rundll32 takes the URL as a plain argument, so no shell ever parses its `&`.
-        let (opener, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-            ("open", &[])
-        } else if cfg!(windows) {
-            ("rundll32", &["url.dll,FileProtocolHandler"])
-        } else {
-            ("xdg-open", &[])
-        };
-        let _ = std::process::Command::new(opener)
-            .args(args)
-            .arg(&url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        if !no_browser {
+            // rundll32 takes the URL as a plain argument, so no shell ever parses its `&`.
+            let (opener, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+                ("open", &[])
+            } else if cfg!(windows) {
+                ("rundll32", &["url.dll,FileProtocolHandler"])
+            } else {
+                ("xdg-open", &[])
+            };
+            let _ = std::process::Command::new(opener)
+                .args(args)
+                .arg(&url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
 
         // Browsers may open speculative connections that never send a request; skip those. The
         // whole wait is bounded so an abandoned login cannot hang the terminal forever.
@@ -136,7 +142,8 @@ impl Auth {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
-                        bail!(
+                        crate::fail!(
+                            crate::output::ErrorCode::AuthFailed,
                             "no browser redirect received within {} minutes; run `dsync init` again",
                             LOGIN_TIMEOUT.as_secs() / 60
                         );
@@ -172,15 +179,24 @@ impl Auth {
         };
         if param("state") != Some(state.as_str()) {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<h2>Invalid OAuth state.</h2>");
-            bail!("OAuth redirect carried an unexpected state value; aborting");
+            crate::fail!(
+                crate::output::ErrorCode::AuthFailed,
+                "OAuth redirect carried an unexpected state value; aborting"
+            );
         }
         let code = match (param("code"), param("error")) {
             (Some(code), _) => urlencoding::decode(code)?.into_owned(),
             (None, Some(err)) => {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h2>Authorization failed.</h2>");
-                bail!("authorization denied: {err}")
+                crate::fail!(
+                    crate::output::ErrorCode::AuthFailed,
+                    "authorization denied: {err}"
+                )
             }
-            _ => bail!("no authorization code in redirect"),
+            _ => crate::fail!(
+                crate::output::ErrorCode::AuthFailed,
+                "no authorization code in redirect"
+            ),
         };
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h2>dsync: authorized. You can close this tab.</h2>");
 
@@ -196,13 +212,22 @@ impl Auth {
             ])
             .send()?
             .error_for_status()
-            .context("exchanging authorization code")?
+            .map_err(|e| {
+                crate::output::coded(
+                    crate::output::ErrorCode::AuthFailed,
+                    format!("exchanging authorization code: {e}"),
+                )
+            })?
             .json()?;
+        let Some(refresh_token) = tok.refresh_token else {
+            crate::fail!(
+                crate::output::ErrorCode::AuthFailed,
+                "Google did not return a refresh token; revoke app access and retry"
+            );
+        };
         Ok(Credentials {
             access_token: tok.access_token,
-            refresh_token: tok
-                .refresh_token
-                .context("Google did not return a refresh token; revoke app access and retry")?,
+            refresh_token,
             expires_at: now() + tok.expires_in,
         })
     }
@@ -275,7 +300,13 @@ impl Auth {
             } else {
                 ""
             };
-            bail!(
+            let code = if body.contains("invalid_grant") {
+                crate::output::ErrorCode::AuthExpired
+            } else {
+                crate::output::ErrorCode::AuthFailed
+            };
+            crate::fail!(
+                code,
                 "token refresh failed ({status}): {body}{hint}\nRun `dsync init` again to re-authorize."
             );
         }

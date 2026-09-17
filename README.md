@@ -38,6 +38,8 @@ one Drive folder, a single static Rust binary. What it does differently:
 - Parallel transfers and hashing (8 streams by default, up to 64); resumable uploads that survive
   a restart.
 - `.driveignore` with gitignore syntax, and `git`-style commands run from anywhere in the folder.
+- Built to be driven: `--json` streams JSON events (plan, prompt, byte progress, results) and
+  every error carries a stable code, so a GUI or script never parses prose.
 
 ## Install
 
@@ -101,11 +103,11 @@ and may be a file or a folder; it defaults to `.`.
 
 | Command | Does |
 |---|---|
-| `init [DIR] --remote-folder P --credentials F` | Authorize and turn `DIR` into a sync folder mirroring `My Drive/P`. `--depth N` limits levels (`-1` = unlimited). |
+| `init [DIR] --remote-folder P --credentials F` | Authorize and turn `DIR` into a sync folder mirroring `My Drive/P`. `--depth N` limits levels (`-1` = unlimited); `--no-browser` prints the authorization URL instead of opening one. |
 | `push [PATH]` | Upload files that are new or newer locally. Shows the plan and asks first. |
 | `pull [PATH]` | Download files that are new or newer on Drive. Shows the plan and asks first. |
 | `diff [PATH]` | List what differs, with both modification times. Changes nothing; exit status 1 if anything differs. |
-| `status` | Local folder, remote folder, depth, cache state, ignore file, filesystem kind, token expiry. |
+| `status [--check]` | Local folder, remote folder, depth, cache state, ignore file, filesystem kind, token expiry. `--check` also contacts Drive: verifies the credentials and the remote folder and prints the signed-in account and storage use. |
 | `update-cache` | Refresh the index of the remote tree only. |
 | `version` | Print the version. |
 
@@ -119,14 +121,67 @@ Options for `push`, `pull` and `diff`:
 | `--refresh` | Ignore the cached index and re-list the whole remote tree. |
 | `--fast` | rsync-style quick check: equal size and mtime is trusted without reading the file. |
 | `--verify` | Re-read every file that needs hashing instead of trusting the local hash cache. |
+| `--dry-run` | `push`/`pull` only. Print the plan and exit without asking or changing anything; exit status 1 if anything would change, 0 if not. |
+| `--skip-conflicts` | `push`/`pull` only. When the plan has conflicts, transfer everything else: with `--no-prompt` instead of refusing, interactively with the usual prompt instead of a "no" default. |
 | `--delete` | `push`/`pull` only. After the transfers, remove from the destination whatever no longer exists on the source: `push` moves Drive entries to the Drive trash; `pull` moves local files to the Trash on macOS or the Recycle Bin on Windows, and deletes them on Linux. Off by default; see [Deleting](#deleting-with---delete). |
 
 Put gitignore-style patterns in `.driveignore` at the sync root to leave things out (`init` creates
 one with `.DS_Store` and `._*`). `.gd/`, symlinks and non-regular files are never synced.
 
-Exit status is 0 on success, 1 when `diff` found differences, and 2 on an error or when any
-transfer failed. `PATH` is taken in its on-disk spelling, so on macOS `push Docs` and `push docs`
+Exit status is 0 on success, 1 when `diff` found differences or `--dry-run` found changes, and 2
+on an error or when any transfer failed. Every error message ends with a stable code in brackets,
+e.g. `error: not inside a dsync workspace [not_workspace]`; the codes are listed under
+[Machine-readable output](#machine-readable-output). `PATH` is taken in its on-disk spelling, so on macOS `push Docs` and `push docs`
 mean the same folder. Only one `dsync` command runs in a workspace at a time; a second one waits.
+
+## Machine-readable output
+
+`--json` (accepted before or after the command) makes every command print one JSON object per line
+on stdout and nothing on stderr, so a GUI or script can follow a run without parsing prose. Each
+object has an `event` field:
+
+| Event | When | Fields |
+|---|---|---|
+| `phase` | a step begins (scanning, listing, uploading...) or the run waits for another instance | `message` |
+| `plan` | one planned entry | `kind` (`add`, `modify`, `delete`, `skip`, `conflict`, `error`), `path`, `dir`, `size`, `note`; deletions add `side` |
+| `summary` | after the plan | `additions`, `modifications`, `deletions` (each `{count, bytes}`), `skips`, `errors`, `conflicts` |
+| `note` | an explanatory line (conflicts, deletions, a retry, a file that changed mid-run) | `text` |
+| `outcome` | nothing to do | `outcome`: `up_to_date`, `nothing_to_transfer`, `in_sync` |
+| `prompt` | `dsync` is waiting for `y`/`n` on stdin | `question`, `default_yes`, `deletions`, `conflicts` |
+| `progress` | bytes moved for one file, at most every 1 MiB or 250 ms | `path`, `bytes`, `total` (null if unknown) |
+| `result` | one item finished | `path`, `dir`, `outcome` (`uploaded`, `updated`, `downloaded`, `mkdir`, `trashed`, `deleted`, `gone`, `skipped`, `failed`), `detail` |
+| `done` | the run finished | `command`, `changes`, `failures` |
+| `warning` | a non-fatal problem | `message`; some carry `code` (`unreadable`, `unmappable`, `special_file`, `deletions_skipped`) and `path` or `name` |
+| `error` | the run stopped | `code` (below), `message`, plus counts where relevant |
+| `diff`, `diff_summary` | `dsync diff` | `change` (`local_only`, `remote_only`, `local_newer`, `remote_newer`, `modified`, `type_mismatch`, `unreadable`, `case_collision`), `path`, `local`, `remote`; then `differ`, `counts` |
+| `status`, `account` | `dsync status` | the same facts as the text form; `--check` follows with `account` (`email`, `name`, `storage_usage`, `storage_limit`, `remote_folder_ok`) |
+| `auth_url`, `initialized` | `dsync init` | `url`; `root`, `remote_folder`, `remote_folder_id` |
+| `cache`, `version` | `update-cache`, `version` | `entries`, `was`, `updated_at`; `version` |
+
+Paths are workspace-relative with `/` separators and no trailing slash (`dir` says which are
+folders), so a name containing two spaces is unambiguous, unlike the text form.
+
+Error codes, present in the `error` event and in brackets at the end of every text error:
+
+| Code | Meaning |
+|---|---|
+| `not_workspace` | not inside an initialized folder |
+| `no_credentials` | the folder has no stored credentials; run `dsync init` |
+| `auth_expired` | the refresh token was revoked or expired; run `dsync init` (see the note on *Testing* apps under [Setup](#setup)) |
+| `auth_failed` | any other authorization failure |
+| `remote_folder_missing` | the remote folder was deleted, trashed, moved or replaced |
+| `path_invalid` | the path is outside the workspace, reserved, excluded, a symlink, or missing |
+| `conflicts` | `--no-prompt` met conflicts (pass `--skip-conflicts` to transfer the rest) |
+| `delete_refused` | `--delete` refused an empty source |
+| `transfer_failed` | the run finished but some items failed (`failures`, `total`) |
+| `api` | Drive rejected a request or could not be reached |
+| `io` | a local filesystem or database error |
+| `usage` | bad arguments |
+| `internal` | anything else |
+
+A typical driver runs `dsync --json push`, renders `plan` events as they arrive, answers the
+`prompt` event by writing `y` or `n` and a newline to stdin, then follows `progress` and `result`
+events until `done`. `--dry-run` produces the plan without a prompt.
 
 ## How it decides what changed
 
@@ -159,7 +214,8 @@ Proceed with the changes? [Y/n]:
 ```
 
 `+` create · `M` overwrite · `!` skipped for a structural reason · `C` conflict · `E` unreadable local file ·
-`D` delete (only with `--delete`).
+`D` delete (only with `--delete`). When stdin is not a terminal the question is followed by a newline,
+so a program driving `dsync` through pipes sees a complete line.
 
 ## What it will never do
 
