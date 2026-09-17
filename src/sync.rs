@@ -670,8 +670,69 @@ pub enum Side {
     Local,
 }
 
-/// A path that was left alone, with the reason.
-pub type Skip = (String, String);
+/// Why a plan entry is what it is. Stable identifiers for the `reason` field of `plan` events;
+/// the wording people see is kept separately in [`Skip::message`] and never changes because of
+/// these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    // modify / conflict
+    LocalNewer,
+    RemoteNewer,
+    ModifiedSameMtime,
+    // modify only
+    ForcedDestinationNewer,
+    // conflict only
+    CaseCollision,
+    // skip
+    NativeDocNotOverwritten,
+    NativeDocNoExport,
+    NativeDocNotTrashed,
+    TypeMismatch,
+    TypeMismatchBelow,
+    OutsideSync,
+    UnreadableFolder,
+    // error
+    Unreadable,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::LocalNewer => "local_newer",
+            Reason::RemoteNewer => "remote_newer",
+            Reason::ModifiedSameMtime => "modified_same_mtime",
+            Reason::ForcedDestinationNewer => "forced_destination_newer",
+            Reason::CaseCollision => "case_collision",
+            Reason::NativeDocNotOverwritten => "native_doc_not_overwritten",
+            Reason::NativeDocNoExport => "native_doc_no_export",
+            Reason::NativeDocNotTrashed => "native_doc_not_trashed",
+            Reason::TypeMismatch => "type_mismatch",
+            Reason::TypeMismatchBelow => "type_mismatch_below",
+            Reason::OutsideSync => "outside_sync",
+            Reason::UnreadableFolder => "unreadable_folder",
+            Reason::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// A path that was left alone: a skip, a conflict or an error, with a stable reason and the
+/// message shown to people.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skip {
+    pub path: String,
+    pub reason: Reason,
+    pub message: String,
+}
+
+impl Skip {
+    pub fn new(path: impl Into<String>, reason: Reason, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            reason,
+            message: message.into(),
+        }
+    }
+}
 
 /// The result of planning.
 #[derive(Debug, Default, PartialEq)]
@@ -704,8 +765,11 @@ fn needs_transfer(
     let d = match dst {
         None => return Some(false),
         Some(d) if d.is_dir => {
-            plan.skips
-                .push((path.into(), format!("{other} is a folder")));
+            plan.skips.push(Skip::new(
+                path,
+                Reason::TypeMismatch,
+                format!("{other} is a folder"),
+            ));
             return None;
         }
         Some(d) => d,
@@ -718,15 +782,23 @@ fn needs_transfer(
         return None; // same size and mtime: assumed identical
     }
     let conflict = if d.mtime_ms > src.mtime_ms + MTIME_TOLERANCE_MS {
-        Some(format!("{other} is newer"))
+        let reason = if other == "remote" {
+            Reason::RemoteNewer
+        } else {
+            Reason::LocalNewer
+        };
+        Some((reason, format!("{other} is newer")))
     } else if within_tolerance(src, d) {
-        Some(Change::Modified.label().to_string())
+        Some((
+            Reason::ModifiedSameMtime,
+            Change::Modified.label().to_string(),
+        ))
     } else {
         None
     };
     match conflict {
-        Some(reason) if !force => {
-            plan.conflicts.push((path.into(), reason));
+        Some((reason, message)) if !force => {
+            plan.conflicts.push(Skip::new(path, reason, message));
             None
         }
         _ => Some(true),
@@ -743,22 +815,29 @@ pub fn plan_push(
     let mut plan = Plan::default();
     for (path, l) in local {
         if collisions.contains(path) {
-            plan.conflicts.push((path.clone(), CASE_COLLISION.into()));
+            plan.conflicts
+                .push(Skip::new(path, Reason::CaseCollision, CASE_COLLISION));
         } else if l.unreadable {
-            plan.errors
-                .push((path.clone(), "could not read local file".into()));
+            plan.errors.push(Skip::new(
+                path,
+                Reason::Unreadable,
+                "could not read local file",
+            ));
         } else if l.is_dir {
             match remote.get(path) {
                 None => plan.actions.push(Action::Mkdir { path: path.clone() }),
-                Some(r) if !r.is_dir => plan
-                    .skips
-                    .push((path.clone(), "remote is a file, local is a folder".into())),
+                Some(r) if !r.is_dir => plan.skips.push(Skip::new(
+                    path,
+                    Reason::TypeMismatch,
+                    "remote is a file, local is a folder",
+                )),
                 Some(_) => {}
             }
         } else if remote.get(path).is_some_and(|r| r.native_doc) {
-            plan.skips.push((
-                path.clone(),
-                "remote is a Google-native document; not overwritten".into(),
+            plan.skips.push(Skip::new(
+                path,
+                Reason::NativeDocNotOverwritten,
+                "remote is a Google-native document; not overwritten",
             ));
         } else if let Some(exists) =
             needs_transfer(l, remote.get(path), force, path, "remote", &mut plan)
@@ -795,22 +874,29 @@ pub fn plan_pull(
     for (path, r) in remote {
         let l = local.get(path);
         if collisions.contains(path) {
-            plan.conflicts.push((path.clone(), CASE_COLLISION.into()));
+            plan.conflicts
+                .push(Skip::new(path, Reason::CaseCollision, CASE_COLLISION));
         } else if l.is_some_and(|l| l.unreadable) {
-            plan.errors
-                .push((path.clone(), "could not read local file".into()));
+            plan.errors.push(Skip::new(
+                path,
+                Reason::Unreadable,
+                "could not read local file",
+            ));
         } else if r.is_dir {
             match l {
                 None => plan.actions.push(Action::Mkdir { path: path.clone() }),
-                Some(l) if !l.is_dir => plan
-                    .skips
-                    .push((path.clone(), "local is a file, remote is a folder".into())),
+                Some(l) if !l.is_dir => plan.skips.push(Skip::new(
+                    path,
+                    Reason::TypeMismatch,
+                    "local is a file, remote is a folder",
+                )),
                 Some(_) => {}
             }
         } else if r.native_doc {
-            plan.skips.push((
-                path.clone(),
-                "Google-native document; export not supported".into(),
+            plan.skips.push(Skip::new(
+                path,
+                Reason::NativeDocNoExport,
+                "Google-native document; export not supported",
             ));
         } else if needs_transfer(r, l, force, path, "local", &mut plan).is_some() {
             plan.actions.push(Action::Download {
@@ -869,32 +955,37 @@ pub fn plan_deletions(
             continue;
         }
         if unreadable.iter().any(|u| under(path, u)) {
-            skips.push((
-                path.clone(),
-                "local folder could not be read; not deleted".into(),
+            skips.push(Skip::new(
+                path,
+                Reason::UnreadableFolder,
+                "local folder could not be read; not deleted",
             ));
             continue;
         }
         if mismatched.iter().any(|m| under(path, m)) {
-            skips.push((
-                path.clone(),
-                "below a path that is a folder on one side and a file on the other; not deleted"
-                    .into(),
+            skips.push(Skip::new(
+                path,
+                Reason::TypeMismatchBelow,
+                "below a path that is a folder on one side and a file on the other; not deleted",
             ));
             continue;
         }
         if unwalked_locally(path) {
-            skips.push((
-                path.clone(),
-                "exists locally outside the sync (symlink, special file or ignored folder); not trashed"
-                    .into(),
+            skips.push(Skip::new(
+                path,
+                Reason::OutsideSync,
+                "exists locally outside the sync (symlink, special file or ignored folder); not trashed",
             ));
             continue;
         }
         match on {
             Side::Remote => {
                 if e.native_doc {
-                    skips.push((path.clone(), "Google-native document; not trashed".into()));
+                    skips.push(Skip::new(
+                        path,
+                        Reason::NativeDocNotTrashed,
+                        "Google-native document; not trashed",
+                    ));
                     continue;
                 }
                 let Some(id) = e.id.clone() else { continue };
@@ -976,6 +1067,8 @@ struct Shown {
     note: String,
     size: Option<u64>,
     dir: bool,
+    /// Stable explanation for the `reason` field; `None` for adds and deletions.
+    reason: Option<Reason>,
 }
 
 impl Shown {
@@ -999,14 +1092,30 @@ impl Shown {
         }
     }
     fn event(&self) -> serde_json::Value {
-        json!({
+        let mut event = json!({
             "event": "plan",
             "kind": self.kind(),
             "path": self.path,
             "dir": self.dir,
             "size": self.size,
             "note": self.note,
-        })
+        });
+        if let Some(reason) = self.reason {
+            event["reason"] = json!(reason.as_str());
+        }
+        event
+    }
+}
+
+/// A skip, conflict or error as a plan line: `!`, `C` or `E`.
+fn skip_parts(marker: &'static str, s: &Skip, dir: bool) -> Shown {
+    Shown {
+        marker,
+        path: s.path.clone(),
+        note: s.message.clone(),
+        size: None,
+        dir,
+        reason: Some(s.reason),
     }
 }
 
@@ -1018,20 +1127,29 @@ fn action_parts(
 ) -> Shown {
     let transfer =
         |path: &str, src: Option<&Entry>, dst: Option<&Entry>, src_name: &str, dst_name: &str| {
-            let (marker, note) = match (src, dst) {
-                (Some(s), None) => ("+", fmt_size(s.size)),
-                (Some(s), Some(d)) if s.mtime_ms > d.mtime_ms + MTIME_TOLERANCE_MS => {
-                    ("M", format!("{}, {src_name} newer", fmt_size(s.size)))
-                }
+            let src_newer = if src_name == "local" {
+                Reason::LocalNewer
+            } else {
+                Reason::RemoteNewer
+            };
+            let (marker, note, reason) = match (src, dst) {
+                (Some(s), None) => ("+", fmt_size(s.size), None),
+                (Some(s), Some(d)) if s.mtime_ms > d.mtime_ms + MTIME_TOLERANCE_MS => (
+                    "M",
+                    format!("{}, {src_name} newer", fmt_size(s.size)),
+                    Some(src_newer),
+                ),
                 (Some(s), Some(d)) if d.mtime_ms > s.mtime_ms + MTIME_TOLERANCE_MS => (
                     "M",
                     format!("{}, forced: {dst_name} is newer", fmt_size(s.size)),
+                    Some(Reason::ForcedDestinationNewer),
                 ),
                 (Some(s), Some(_)) => (
                     "M",
                     format!("{}, {}", fmt_size(s.size), Change::Modified.label()),
+                    Some(Reason::ModifiedSameMtime),
                 ),
-                (None, _) => ("M", String::new()),
+                (None, _) => ("M", String::new(), None),
             };
             Shown {
                 marker,
@@ -1039,6 +1157,7 @@ fn action_parts(
                 note,
                 size: src.and_then(|s| s.size),
                 dir: false,
+                reason,
             }
         };
     match a {
@@ -1048,6 +1167,7 @@ fn action_parts(
             note: String::new(),
             size: None,
             dir: true,
+            reason: None,
         },
         Action::Upload { path, .. } => {
             transfer(path, local.get(path), remote.get(path), "local", "remote")
@@ -1088,6 +1208,7 @@ fn delete_parts(
         },
         size,
         dir: d.is_dir(),
+        reason: None,
     }
 }
 
@@ -1164,16 +1285,10 @@ fn list_entries(
         ("C", &plan.conflicts, "conflict"),
         ("E", &plan.errors, "error"),
     ] {
-        for (path, reason) in items {
-            let s = Shown {
-                marker,
-                path: path.clone(),
-                note: reason.clone(),
-                size: None,
-                dir: is_dir(path),
-            };
+        for item in items {
+            let s = skip_parts(marker, item, is_dir(&item.path));
             output::out(s.event(), || {
-                line(marker, path, &format!("{prefix}: {reason}"))
+                line(marker, &item.path, &format!("{prefix}: {}", item.message))
             });
         }
     }
@@ -2569,6 +2684,7 @@ mod tests {
         let plan = plan_push(&gone, &remote, false, &none());
         assert!(plan.actions.is_empty());
         assert_eq!(plan.errors.len(), 1);
+        assert_eq!(plan.errors[0].reason, Reason::Unreadable);
         assert_eq!(
             plan_pull(&gone, &remote, true, &none()).errors.len(),
             1,
@@ -2669,11 +2785,12 @@ mod tests {
         assert_eq!(
             plan.conflicts,
             vec![
-                ("older.txt".to_string(), "remote is newer".to_string()),
-                (
-                    "size_differs.txt".to_string(),
-                    "content differs, same mtime".to_string()
-                )
+                Skip::new("older.txt", Reason::RemoteNewer, "remote is newer"),
+                Skip::new(
+                    "size_differs.txt",
+                    Reason::ModifiedSameMtime,
+                    "content differs, same mtime"
+                ),
             ]
         );
         let forced = plan_push(&local, &remote, true, &none());
@@ -2710,19 +2827,21 @@ mod tests {
         assert_eq!(
             plan.conflicts,
             vec![
-                ("newer.txt".to_string(), "local is newer".to_string()),
-                (
-                    "size_differs.txt".to_string(),
-                    "content differs, same mtime".to_string()
-                )
+                Skip::new("newer.txt", Reason::LocalNewer, "local is newer"),
+                Skip::new(
+                    "size_differs.txt",
+                    Reason::ModifiedSameMtime,
+                    "content differs, same mtime"
+                ),
             ]
         );
         remote.get_mut("rdir/r.txt").unwrap().native_doc = true;
         assert_eq!(
             plan_pull(&local, &remote, false, &none()).skips,
-            vec![(
-                "rdir/r.txt".to_string(),
-                "Google-native document; export not supported".to_string()
+            vec![Skip::new(
+                "rdir/r.txt",
+                Reason::NativeDocNoExport,
+                "Google-native document; export not supported"
             )]
         );
         // A local file that collides with a Google-native document is never uploaded over it.
@@ -2747,6 +2866,11 @@ mod tests {
             .collect();
         assert_eq!(plan_push(&l2, &r2, false, &none()).skips.len(), 1);
         assert_eq!(plan_pull(&l2, &r2, false, &none()).skips.len(), 1);
+        assert!(plan_push(&l2, &r2, false, &none())
+            .skips
+            .iter()
+            .chain(plan_pull(&l2, &r2, false, &none()).skips.iter())
+            .all(|s| s.reason == Reason::TypeMismatch));
     }
 
     #[test]
@@ -2809,6 +2933,10 @@ mod tests {
         let safe = plan_pull(&local, &remote, true, &collisions);
         assert!(safe.actions.is_empty());
         assert_eq!(safe.conflicts.len(), 3);
+        assert!(safe
+            .conflicts
+            .iter()
+            .all(|c| c.reason == Reason::CaseCollision));
         let push = plan_push(&local, &remote, true, &collisions);
         assert_eq!(
             push.actions,
@@ -3455,7 +3583,8 @@ mod tests {
         );
         assert!(matches!(&push[1], Delete::Remote { is_dir: true, .. }));
         assert_eq!(skips.len(), 1);
-        assert!(skips[0].0 == "doc" && skips[0].1.contains("Google-native"));
+        assert!(skips[0].path == "doc" && skips[0].reason == Reason::NativeDocNotTrashed);
+        assert!(skips[0].message.contains("Google-native"));
 
         let (pull, skips) = plan_deletions(&no_root, &local, &remote, &none(), Side::Local);
         let paths: Vec<&str> = pull.iter().map(Delete::path).collect();
@@ -3500,7 +3629,7 @@ mod tests {
         assert!(!push.iter().any(|d| d.path().starts_with("locked")));
         assert!(skips
             .iter()
-            .any(|(p, why)| p == "locked/x.txt" && why.contains("could not be read")));
+            .any(|s| s.path == "locked/x.txt" && s.reason == Reason::UnreadableFolder));
 
         // A file on one side and a folder on the other: the folder's contents are not "missing".
         local.insert("notes".to_string(), sized(1, 9));
@@ -3513,7 +3642,7 @@ mod tests {
         assert_eq!(
             skips
                 .iter()
-                .filter(|(_, why)| why.contains("folder on one side"))
+                .filter(|s| s.reason == Reason::TypeMismatchBelow)
                 .count(),
             3
         );
@@ -3522,7 +3651,7 @@ mod tests {
         remote.insert("mixed".to_string(), remote_entry("M", false, 3));
         let (pull, skips) = plan_deletions(&no_root, &local, &remote, &none(), Side::Local);
         assert!(!pull.iter().any(|d| d.path().starts_with("mixed")));
-        assert!(skips.iter().any(|(p, _)| p == "mixed/deep.txt"));
+        assert!(skips.iter().any(|s| s.path == "mixed/deep.txt"));
     }
 
     #[cfg(unix)]
@@ -3546,9 +3675,7 @@ mod tests {
         let paths: Vec<&str> = push.iter().map(Delete::path).collect();
         assert_eq!(paths, ["really-gone.txt"]);
         assert_eq!(skips.len(), 4);
-        assert!(skips
-            .iter()
-            .all(|(_, why)| why.contains("outside the sync")));
+        assert!(skips.iter().all(|s| s.reason == Reason::OutsideSync));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3604,7 +3731,33 @@ mod tests {
         assert_eq!(up.event()["kind"], "modify");
         assert_eq!(up.event()["size"], 1234);
         assert_eq!(up.event()["dir"], false);
+        assert_eq!(up.event()["reason"], "forced_destination_newer");
         assert_eq!(up.human(), "M docs/a.txt  1,234 B, forced: remote is newer");
+        // The plain "source is newer" case names the side, using diff's vocabulary: the local
+        // copy (mtime 2_000_000) is newer than the remote one (1_000_000).
+        local.insert("docs/b.txt".to_string(), sized(2_000_000, 10));
+        remote.insert("docs/b.txt".to_string(), remote_entry("B", false, 10));
+        let newer = Action::Upload {
+            path: "docs/b.txt".into(),
+            existing: None,
+            mtime_ms: 2_000_000,
+        };
+        assert_eq!(
+            action_parts(&newer, &local, &remote).event()["reason"],
+            "local_newer"
+        );
+        let pulled = Action::Download {
+            path: "docs/b.txt".into(),
+            id: "B".into(),
+            mtime_ms: 1_000_000,
+            md5: None,
+            expected_local: None,
+        };
+        // Pulling it the other way would overwrite the newer local copy: only --force does that.
+        assert_eq!(
+            action_parts(&pulled, &local, &remote).event()["reason"],
+            "forced_destination_newer"
+        );
         let del = delete_parts(
             &Delete::Remote {
                 path: "docs/a.txt".into(),
@@ -3618,6 +3771,56 @@ mod tests {
         );
         assert_eq!(del.event()["kind"], "delete");
         assert_eq!(del.event()["size"], 1000);
+        assert!(
+            del.event().get("reason").is_none(),
+            "deletions carry side, not reason"
+        );
+        // Skips, conflicts and errors carry their reason; the note stays the human message.
+        let doc = skip_parts(
+            "!",
+            &Skip::new(
+                "Budget",
+                Reason::NativeDocNoExport,
+                "Google-native document; export not supported",
+            ),
+            false,
+        );
+        assert_eq!(doc.event()["kind"], "skip");
+        assert_eq!(doc.event()["reason"], "native_doc_no_export");
+        assert_eq!(
+            doc.event()["note"],
+            "Google-native document; export not supported"
+        );
+        let clash = skip_parts(
+            "C",
+            &Skip::new("Readme.md", Reason::CaseCollision, CASE_COLLISION),
+            false,
+        );
+        assert_eq!(clash.event()["kind"], "conflict");
+        assert_eq!(clash.event()["reason"], "case_collision");
+        let bad = skip_parts(
+            "E",
+            &Skip::new("locked", Reason::Unreadable, "could not read local file"),
+            true,
+        );
+        assert_eq!(bad.event()["kind"], "error");
+        assert_eq!(bad.event()["reason"], "unreadable");
+        assert_eq!(bad.event()["dir"], true);
+        // The planners attach the same reasons.
+        let mut ndoc = remote_entry("D", false, 7);
+        ndoc.native_doc = true;
+        let mut l = BTreeMap::new();
+        let mut r = BTreeMap::new();
+        l.insert("Budget".to_string(), sized(1, 7));
+        r.insert("Budget".to_string(), ndoc);
+        assert_eq!(
+            plan_push(&l, &r, false, &none()).skips[0].reason,
+            Reason::NativeDocNotOverwritten
+        );
+        assert_eq!(
+            plan_pull(&l, &r, false, &none()).skips[0].reason,
+            Reason::NativeDocNoExport
+        );
         // A path with two spaces inside is unambiguous in the event, unlike the text line.
         let odd = Shown {
             marker: "+",
@@ -3625,6 +3828,7 @@ mod tests {
             note: "9 B".into(),
             size: Some(9),
             dir: false,
+            reason: None,
         };
         assert_eq!(odd.human(), "+ a  b.txt  9 B");
         assert_eq!(odd.event()["path"], "a  b.txt");
@@ -3637,7 +3841,7 @@ mod tests {
         let mut plan = Plan::default();
         plan.actions.push(Action::Mkdir { path: "d".into() });
         plan.conflicts
-            .push(("c.txt".into(), "remote is newer".into()));
+            .push(Skip::new("c.txt", Reason::RemoteNewer, "remote is newer"));
         let err = confirm(&plan, &local, &remote, true, false).unwrap_err();
         assert_eq!(output::code_of(&err).0, output::ErrorCode::Conflicts);
         assert_eq!(
@@ -3647,7 +3851,7 @@ mod tests {
         // Conflicts and nothing else: still refused unattended, and "nothing" once acknowledged.
         let mut only = Plan::default();
         only.conflicts
-            .push(("c.txt".into(), "remote is newer".into()));
+            .push(Skip::new("c.txt", Reason::RemoteNewer, "remote is newer"));
         let err = confirm(&only, &local, &remote, true, false).unwrap_err();
         assert_eq!(output::code_of(&err).0, output::ErrorCode::Conflicts);
         assert_eq!(

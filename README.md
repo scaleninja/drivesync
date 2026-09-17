@@ -143,7 +143,7 @@ on stdout and nothing on stderr, so a GUI or script can follow a run without par
 | Event | When | Fields |
 |---|---|---|
 | `phase` | a step begins (scanning, listing, uploading...) or the run waits for another instance | `message` |
-| `plan` | one planned entry | `kind` (`add`, `modify`, `delete`, `skip`, `conflict`, `error`), `path`, `dir`, `size`, `note`; deletions add `side` |
+| `plan` | one planned entry | `kind` (`add`, `modify`, `delete`, `skip`, `conflict`, `error`), `path`, `dir`, `size`, `note`; deletions add `side`; `modify`, `skip`, `conflict` and `error` add `reason` (below) |
 | `summary` | after the plan | `additions`, `modifications`, `deletions` (each `{count, bytes}`), `skips`, `errors`, `conflicts` |
 | `note` | an explanatory line (conflicts, deletions, a retry, a file that changed mid-run) | `text` |
 | `outcome` | nothing to do | `outcome`: `up_to_date`, `nothing_to_transfer`, `in_sync` |
@@ -160,6 +160,17 @@ on stdout and nothing on stderr, so a GUI or script can follow a run without par
 
 Paths are workspace-relative with `/` separators and no trailing slash (`dir` says which are
 folders), so a name containing two spaces is unambiguous, unlike the text form.
+
+`reason` on a `plan` event is a stable identifier for what `note` says in words, so a reader can
+render its own text (`note` is English and may change; `reason` will not). Absent on `add` and
+`delete` entries. The values, sharing `diff`'s vocabulary where they overlap:
+
+| `kind` | `reason` values |
+|---|---|
+| `modify` | `local_newer`, `remote_newer` (the source is newer), `forced_destination_newer` (`--force` overwrote a newer copy), `modified_same_mtime` (content differs at equal mtime) |
+| `conflict` | `local_newer`, `remote_newer` (the destination is newer), `modified_same_mtime`, `case_collision` |
+| `skip` | `native_doc_not_overwritten`, `native_doc_no_export`, `native_doc_not_trashed`, `type_mismatch` (folder on one side, file on the other), `type_mismatch_below` (under such a path; `--delete` only), `outside_sync` (exists locally as a symlink, special file or ignored folder; `--delete` only), `unreadable_folder` (under a local folder that could not be read; `--delete` only) |
+| `error` | `unreadable` |
 
 Error codes, present in the `error` event and in brackets at the end of every text error:
 
