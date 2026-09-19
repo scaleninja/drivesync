@@ -6,7 +6,8 @@ modelled on [odeke-em/drive](https://github.com/odeke-em/drive).
 
 - Home: <https://scaleninja.com/drivesync/>
 - Source: <https://github.com/scaleninja/drivesync>
-- License: [MIT](LICENSE)
+- License: [MIT](LICENSE); the crates linked into the binaries keep their own, reproduced in
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
 > **Tested on:** macOS, with both a consumer `@gmail.com` account and a Google Workspace account.
 > Linux and Windows builds are produced and smoke-tested in CI but have not been exercised against
@@ -327,12 +328,21 @@ The guards:
 ```
 make build | release | test | check     # check = fmt + clippy
 make all-targets                        # Linux (static musl via cargo-zigbuild) + macOS into dist/
+make notices                            # regenerate THIRD-PARTY-NOTICES.md after a dep change
 make setup                              # one-time: rustup targets + cargo-zigbuild (needs zig)
 ```
 
 CI runs fmt, clippy, tests and a locked build on Linux, macOS and Windows for every push and pull
-request; tags `v*` build all five targets (Linux and macOS on x86_64 and arm64, Windows on x86_64)
-and publish them with a `SHA256SUMS` file.
+request, and fails if `THIRD-PARTY-NOTICES.md` no longer matches the lockfile; tags `v*` build all
+five targets (Linux and macOS on x86_64 and arm64, Windows on x86_64) and publish them with a
+`SHA256SUMS` file and the notices.
+
+Every dependency is statically linked, so each published binary is a distribution of those crates'
+code and carries their licence obligations. `scripts/third-party-notices.sh` collects the notices
+from the resolved dependency graph of all five release targets — MIT, Apache-2.0, ISC, BSD,
+Unicode-3.0 and CDLA-Permissive among them, with nothing copyleft — and groups crates that share
+an identical licence text. Anyone redistributing dsync, bundled inside a larger app included,
+should ship that file alongside it.
 
 To ship builds to your own users with a bundled OAuth client, set both variables at build time;
 `init` then needs no `--client-id`/`--client-secret`. Google treats desktop client secrets as

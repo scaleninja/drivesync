@@ -1,6 +1,7 @@
 # DriveSync (dsync) — https://github.com/scaleninja/drivesync
 #
 # Native:        make build | make release | make test | make install
+# Licences:      make notices                (regenerate THIRD-PARTY-NOTICES.md)
 # Cross-compile: make all-targets            (all four targets into dist/)
 #                make linux-x86_64 linux-arm64 macos-x86_64 macos-arm64
 # One-time:      make setup                  (rustup targets + cargo-zigbuild; needs `zig` on PATH)
@@ -20,7 +21,7 @@ MAC_X86     := x86_64-apple-darwin
 MAC_ARM     := aarch64-apple-darwin
 ALL_TARGETS := $(LINUX_X86) $(LINUX_ARM) $(MAC_X86) $(MAC_ARM)
 
-.PHONY: build release test check fmt clean install setup all-targets \
+.PHONY: build release test check fmt clean install setup all-targets notices \
         linux-x86_64 linux-arm64 macos-x86_64 macos-arm64
 
 build:
@@ -38,6 +39,12 @@ check:
 
 fmt:
 	cargo fmt
+
+# Every crate we link is distributed inside our binaries, so its licence notice ships with them.
+# Re-run after any dependency change; CI fails if the committed file is out of date.
+notices:
+	scripts/third-party-notices.sh > THIRD-PARTY-NOTICES.md
+	@wc -l < THIRD-PARTY-NOTICES.md | xargs echo "THIRD-PARTY-NOTICES.md lines:"
 
 install:
 	cargo install --path . --locked

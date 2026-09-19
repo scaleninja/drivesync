@@ -61,12 +61,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checked out before the artifacts land: actions/checkout cleans the workspace.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum dsync-* > SHA256SUMS && cat SHA256SUMS
+      # The licences of the crates linked into these binaries travel with the release.
+      - name: Attach third-party notices
+        run: cp THIRD-PARTY-NOTICES.md dist/
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

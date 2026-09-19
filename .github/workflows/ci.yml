@@ -35,6 +35,24 @@ jobs:
           ./target/release/dsync${{ matrix.exe }} --help
           ! ./target/release/dsync${{ matrix.exe }} status 2>/dev/null
 
+  notices:
+    name: third-party notices up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Every crate in the lockfile is linked into the binaries we publish, so its licence
+      # notice has to ship with them. Regenerating here catches a dependency change that
+      # landed without THIRD-PARTY-NOTICES.md being refreshed.
+      - run: cargo fetch --locked
+      - run: scripts/third-party-notices.sh > /tmp/notices.md
+      - name: Compare with the committed file
+        run: |
+          diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md && exit 0
+          echo "::error file=THIRD-PARTY-NOTICES.md::out of date; run 'make notices' and commit the result"
+          exit 1
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-latest
