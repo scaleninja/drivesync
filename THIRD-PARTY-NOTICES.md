@@ -1,6 +1,6 @@
 # Third-party notices
 
-dsync 0.5.0 links the Rust crates listed below into every binary it ships. They are not
+dsync 0.6.0 links the Rust crates listed below into every binary it ships. They are not
 ScaleNinja code; each is used under its own licence, reproduced here in full as those
 licences require. dsync itself is MIT-licensed — see [LICENSE](LICENSE).
 
