@@ -17,6 +17,10 @@
 # Needs jq and a cargo registry holding the crate sources; `cargo fetch --locked` is enough,
 # and a populated registry means the script itself never reaches the network.
 set -euo pipefail
+# Byte-for-byte reproducible wherever it runs: `sort` orders `_` and `-` differently under
+# en_US.UTF-8 (a Mac terminal) and C.UTF-8 (a CI runner), and the CI job diffs this output
+# against the committed file.
+export LC_ALL=C
 
 case "${1:-}" in
   -h|--help) awk 'NR > 1 && /^#/ { if (!/^# shellcheck/) { sub(/^# ?/, ""); print }; next }
@@ -109,8 +113,9 @@ cut -f1 "$work/index" | sort -u | while read -r sum; do
   awk -F'\t' -v s="$sum" '$1 == s { print "- " $2 }' "$work/index" | sort -u
   printf '\n```\n'
   # A stray fence in a licence file would end the block early; there are none today, and the
-  # guard keeps that true if a crate ever adds one.
-  sed 's/^```/ ```/' "$file"
+  # guard keeps that true if a crate ever adds one. Some licence files have CRLF line endings;
+  # git normalises those away on commit, so emit LF only or the CI comparison never matches.
+  tr -d '\r' < "$file" | sed 's/^```/ ```/'
   printf '```\n\n'
 done
 

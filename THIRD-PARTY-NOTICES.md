@@ -33,8 +33,8 @@ A crate that applies to only some of them is still listed; the set is the union.
 | bstr | 1.13.1 | MIT OR Apache-2.0 |
 | bytes | 1.12.1 | MIT |
 | cc | 1.4.5 | MIT OR Apache-2.0 |
-| cfg_aliases | 0.2.2 | MIT |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
+| cfg_aliases | 0.2.2 | MIT |
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 |
 | chrono | 0.4.45 | MIT OR Apache-2.0 |
 | clap | 4.6.6 | MIT OR Apache-2.0 |
@@ -180,7 +180,6 @@ A crate that applies to only some of them is still listed; the set is the union.
 | webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | windows | 0.62.2 | MIT OR Apache-2.0 |
-| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 |
 | windows-future | 0.3.2 | MIT OR Apache-2.0 |
@@ -194,6 +193,7 @@ A crate that applies to only some of them is still listed; the set is the union.
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 |
+| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | writeable | 0.6.4 | Unicode-3.0 |
 | yoke | 0.8.3 | Unicode-3.0 |
 | yoke-derive | 0.8.2 | Unicode-3.0 |
@@ -9098,7 +9098,6 @@ copyright holder is the crate author named here.
 | objc2-encode | 4.1.0 | MIT | Mads Marquart <mads@marquart.dk> | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | — | https://github.com/madsmtm/objc2 |
 | windows | 0.62.2 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
-| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | Microsoft | https://github.com/microsoft/windows-rs |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
 | windows-future | 0.3.2 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
@@ -9112,4 +9111,5 @@ copyright holder is the crate author named here.
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 | Microsoft | https://github.com/microsoft/windows-rs |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 | — | https://github.com/microsoft/windows-rs |
+| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | Microsoft | https://github.com/microsoft/windows-rs |
 
