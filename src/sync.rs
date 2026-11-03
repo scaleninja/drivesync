@@ -110,10 +110,15 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 fn valid_name_on(name: &str, windows: bool) -> bool {
+    name.len() <= 255 && plain_name(name, windows)
+}
+
+/// One plain path component on this kind of platform, whatever its length (local names may exceed
+/// 255 bytes where the limit counts UTF-16 units, as on macOS and Windows).
+fn plain_name(name: &str, windows: bool) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && name.len() <= 255
         && !name.contains(['/', '\0'])
         && (!windows || valid_windows_name(name))
 }
@@ -206,17 +211,9 @@ pub fn parent_of(path: &str) -> &str {
 }
 
 /// Printable form of a path: control and bidirectional formatting characters are escaped so
-/// untrusted names can neither drive the terminal nor disguise themselves (see `needs_escape`).
+/// untrusted names can neither drive the terminal nor disguise themselves.
 pub fn display(path: &str) -> String {
-    path.chars()
-        .map(|c| {
-            if output::needs_escape(c) {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    output::escape(path)
 }
 
 /// Paths dsync owns or must never write: anything under `.gd/` and download temp files. Matched
@@ -318,7 +315,9 @@ pub fn is_excluded(root: &Path, ignore: &Gitignore, abs: &Path) -> bool {
 pub fn filter_remote(root: &Path, ignore: &Gitignore, remote: &mut BTreeMap<String, Entry>) {
     remote.retain(|rel, e| {
         if !valid_rel(rel) {
-            output::unmappable(rel);
+            if valid_rel(parent_of(rel)) || parent_of(rel).is_empty() {
+                output::unmappable_path(rel); // once, for the topmost; its subtree goes silently
+            }
             return false;
         }
         !is_reserved(rel)
@@ -388,7 +387,13 @@ pub fn local_walk(
                 if let Ok(rel) = rel_path(root, &path) {
                     output::err(
                         json!({ "event": "warning", "code": "unreadable", "path": rel, "message": e.to_string() }),
-                        || format!("warning: could not read {}: {e}", display(&rel)),
+                        || {
+                            format!(
+                                "warning: could not read {}: {}",
+                                display(&rel),
+                                display(&e.to_string())
+                            )
+                        },
                     );
                     out.insert(
                         rel,
@@ -422,7 +427,7 @@ pub fn local_walk(
                         "path": entry.path().to_string_lossy(),
                         "message": format!("{e:#}"),
                     }),
-                    || format!("! skip     {e:#}"),
+                    || format!("! skip     {}", display(&format!("{e:#}"))),
                 );
                 continue;
             }
@@ -562,7 +567,13 @@ pub fn fill_hashes(
             Err(e) => {
                 output::err(
                     json!({ "event": "warning", "code": "unreadable", "path": path, "message": format!("{e:#}") }),
-                    || format!("warning: could not read {}: {e:#}", display(&path)),
+                    || {
+                        format!(
+                            "warning: could not read {}: {}",
+                            display(&path),
+                            display(&format!("{e:#}"))
+                        )
+                    },
                 );
                 entry.unreadable = true;
             }
@@ -925,6 +936,12 @@ pub fn plan_push(
 const IGNORE_FILE_KEPT: &str =
     "pull never replaces the local .driveignore; to adopt the Drive copy, delete the local one and pull again";
 
+/// Whether workspace path `rel` is the root `.driveignore`, in any spelling the filesystem may
+/// resolve to it.
+fn is_ignore_file(rel: &str) -> bool {
+    alias_form(rel) == IGNORE_FILE
+}
+
 /// Plan a pull.
 pub fn plan_pull(
     local: &BTreeMap<String, Entry>,
@@ -960,9 +977,10 @@ pub fn plan_pull(
                 Reason::NativeDocNoExport,
                 "Google-native document; export not supported",
             ));
-        } else if l.is_some() && path == IGNORE_FILE {
-            // Differs at all (whichever side is newer): reported, never transferred.
-            if needs_transfer(r, l, true, path, "local", &mut Plan::default()).is_some() {
+        } else if l.is_some() && is_ignore_file(path) {
+            // Differs at all (whichever side is newer): reported, never transferred. `force` so
+            // that a newer local copy is not a conflict; a folder there is still a type mismatch.
+            if needs_transfer(r, l, true, path, "local", &mut plan).is_some() {
                 plan.skips
                     .push(Skip::new(path, Reason::IgnoreFileKept, IGNORE_FILE_KEPT));
             }
@@ -1038,7 +1056,7 @@ pub fn plan_deletions(
             ));
             continue;
         }
-        if on == Side::Local && path == IGNORE_FILE {
+        if on == Side::Local && is_ignore_file(path) {
             skips.push(Skip::new(
                 path,
                 Reason::IgnoreFileKept,
@@ -1601,14 +1619,11 @@ pub fn guard_parents(root: &Path, rel: &str) -> Result<()> {
         let mut parsed = Path::new(c).components();
         let single = matches!(parsed.next(), Some(std::path::Component::Normal(n)) if n == *c)
             && parsed.next().is_none();
-        if !single || !valid_name(c) {
+        if !single || !plain_name(c, cfg!(windows)) {
             bail!("refusing to write {}: not a plain local name", display(rel));
         }
     }
-    // A name the filesystem resolves to the state folder under another spelling (an NTFS 8.3
-    // short name such as `GD~1`, or any case or normalization variant not caught above).
-    let top = root.join(comps[0]);
-    if same_file::is_same_file(&top, root.join(GD_DIR)).unwrap_or(false) {
+    if aliases_state_dir(root, comps[0]) {
         bail!("refusing to write reserved path {}", display(rel));
     }
     let mut cur = root.to_path_buf();
@@ -1624,6 +1639,34 @@ pub fn guard_parents(root: &Path, rel: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the top-level entry `name` is the workspace's `.gd` under a spelling `is_reserved`
+/// does not know, compared by identity. On Unix two stats (a symlink is followed, which
+/// `guard_parents` refuses anyway). On Windows only names with a `~` are checked: an NTFS 8.3
+/// short name such as `GD~1` is the alias name rules cannot predict, and the check opens handles.
+fn aliases_state_dir(root: &Path, name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (
+            std::fs::metadata(root.join(name)),
+            std::fs::metadata(root.join(GD_DIR)),
+        ) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        name.contains('~')
+            && same_file::is_same_file(root.join(name), root.join(GD_DIR)).unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, name);
+        false
+    }
 }
 
 /// The destination file itself, checked immediately before it is replaced: not a symlink, and
@@ -1754,7 +1797,9 @@ impl crate::drive::SessionStore for Sessions<'_> {
 }
 
 /// Report what happened to one planned item: a `result` event, or the classic one-liner.
+/// `human` is one line built around untrusted names and error text, so it is escaped whole.
 fn report(path: &str, dir: bool, outcome: &str, detail: &str, human: String) {
+    let human = output::escape(&human);
     let event = json!({
         "event": "result",
         "path": path,
@@ -3581,6 +3626,9 @@ mod tests {
         assert!(guard_parents(&dir, "ok/file.txt").is_ok());
         assert!(guard_parents(&dir, "a/../b").is_err());
         assert!(guard_parents(&dir, "a//b").is_err());
+        // Local names may exceed the 255 bytes a remote name is held to (macOS and Windows count
+        // UTF-16 units): 150 x "é" is 300 bytes.
+        assert!(guard_parents(&dir, &format!("{}/f.txt", "é".repeat(150))).is_ok());
         #[cfg(windows)]
         assert!(guard_parents(&dir, "..\\..\\escape.txt").is_err());
     }
@@ -3774,6 +3822,25 @@ mod tests {
         let plan = plan_pull(&local, &[(ignore.clone(), older)].into(), true, &none());
         assert!(plan.actions.is_empty() && plan.conflicts.is_empty());
         assert_eq!(plan.skips[0].reason, Reason::IgnoreFileKept);
+        // A spelling the filesystem resolves to the same file (macOS, Windows) is the same file.
+        let upper = ".DriveIgnore".to_string();
+        let plan = plan_pull(
+            &[(upper.clone(), sized(1_000_000, 40))].into(),
+            &[(upper.clone(), newer.clone())].into(),
+            false,
+            &none(),
+        );
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.skips[0].reason, Reason::IgnoreFileKept);
+        // A local folder of that name is still reported as a type mismatch.
+        let plan = plan_pull(
+            &[(ignore.clone(), e(1, None, true))].into(),
+            &remote,
+            false,
+            &none(),
+        );
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.skips[0].reason, Reason::TypeMismatch);
         // Identical content: nothing to say.
         let mut same = sized(1_000_000, 40);
         same.md5 = Some("m".into());

@@ -325,7 +325,9 @@ The guards:
   transferred (HFS+ stores accented names in NFD form, which can trigger this for names created on
   Drive). Filesystems with coarse timestamps (FAT, exFAT, some network shares) cause more hashing
   but no wrong decisions, since content is compared by MD5. Names longer than 255 bytes cannot be
-  local files and are skipped.
+  local files and are skipped. dsync's own names are reserved in every spelling a case-folding
+  filesystem could resolve to them, on every platform: `.gd` in any case (or with a trailing dot or
+  space) and names ending in `.dsync-part` in any case are never synced, even on Linux.
 
 ## Building
 

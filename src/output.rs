@@ -27,12 +27,22 @@ pub fn needs_escape(c: char) -> bool {
         || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// `text` as it may reach a terminal: every character `needs_escape` flags is shown escaped,
-/// except the newlines and tabs of dsync's own layout.
+/// `text` as one line for a terminal: every character `needs_escape` flags is shown escaped,
+/// newlines and tabs included. For lines that embed untrusted names or error text.
+pub fn escape(text: &str) -> String {
+    escape_with(text, false)
+}
+
+/// `text` as it may reach a terminal: like `escape`, but the newlines and tabs of dsync's own
+/// multi-line messages are kept.
 pub fn terminal_safe(text: &str) -> String {
+    escape_with(text, true)
+}
+
+fn escape_with(text: &str, keep_layout: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if needs_escape(c) && c != '\n' && c != '\t' {
+        if needs_escape(c) && !(keep_layout && matches!(c, '\n' | '\t')) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -68,7 +78,7 @@ pub fn err(event: Value, human: impl FnOnce() -> String) {
 /// A non-fatal problem the run continues past.
 pub fn warning(message: &str) {
     err(json!({ "event": "warning", "message": message }), || {
-        format!("warning: {message}")
+        format!("warning: {}", escape(message))
     });
 }
 
@@ -77,6 +87,16 @@ pub fn unmappable(name: &str) {
     err(
         json!({ "event": "warning", "code": "unmappable", "name": name, "message": "remote name cannot be a local path" }),
         || format!("! skip     remote name {name:?} cannot be a local path"),
+    );
+}
+
+/// An indexed remote entry at workspace path `path` whose last component cannot be a local name
+/// (recorded by an older version with laxer rules); the entry and everything below it are skipped.
+pub fn unmappable_path(path: &str) {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    err(
+        json!({ "event": "warning", "code": "unmappable", "name": name, "path": path, "message": "remote name cannot be a local path" }),
+        || format!("! skip     remote path {path:?} cannot be a local path"),
     );
 }
 
