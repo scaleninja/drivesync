@@ -102,14 +102,50 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Drive allows names that cannot be mapped onto a local path ("/", ".", "..", empty, or longer
-/// than the 255 bytes Linux and macOS filesystems accept for one component).
+/// than the 255 bytes Linux and macOS filesystems accept for one component). On Windows the
+/// Win32 rules apply as well (see `valid_windows_name`): a Drive name is untrusted input, and one
+/// such as `..\..\x` or `C:\x` would otherwise be a path rather than a name there.
 pub fn valid_name(name: &str) -> bool {
+    valid_name_on(name, cfg!(windows))
+}
+
+fn valid_name_on(name: &str, windows: bool) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
         && name.len() <= 255
-        && !name.contains('/')
-        && !name.contains('\0')
+        && !name.contains(['/', '\0'])
+        && (!windows || valid_windows_name(name))
+}
+
+/// A name Win32 maps onto exactly one file in the directory it is joined to: no separator (`\`),
+/// drive, stream or UNC marker (`:`), wildcard or other reserved character, or control character;
+/// no trailing dot or space (Win32 strips them, so `.. ` would become `..`); and no device name
+/// (`CON`, `nul.txt`, `COM1`...), which opens a device instead of a file.
+fn valid_windows_name(name: &str) -> bool {
+    if name.chars().any(|c| c < ' ' || r#"\:<>"|?*"#.contains(c)) || name.ends_with(['.', ' ']) {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            matches!(
+                n,
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    };
+    !(matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT"))
+}
+
+/// Whether every component of the slash-separated workspace path `rel` is a valid name.
+pub fn valid_rel(rel: &str) -> bool {
+    rel.split('/').all(valid_name)
 }
 
 /// Name of the private temp file a download is written to, next to its destination. Kept short so
@@ -265,9 +301,14 @@ pub fn is_excluded(root: &Path, ignore: &Gitignore, abs: &Path) -> bool {
 }
 
 /// Drop remote entries the local side would never scan, so nothing can be pulled over an ignored
-/// or reserved local path, and nothing ignored is ever compared.
+/// or reserved local path, and nothing ignored is ever compared. Names are re-checked here too:
+/// the index may hold entries recorded by an older version with laxer rules.
 pub fn filter_remote(root: &Path, ignore: &Gitignore, remote: &mut BTreeMap<String, Entry>) {
     remote.retain(|rel, e| {
+        if !valid_rel(rel) {
+            output::unmappable(rel);
+            return false;
+        }
         !is_reserved(rel)
             && !ignore
                 .matched_path_or_any_parents(root.join(rel), e.is_dir)
@@ -1513,13 +1554,23 @@ pub fn diff_line(
 // Filesystem guards: the executor never trusts the plan's view of the destination.
 
 /// Every ancestor of `rel` inside the workspace must be a real directory or absent: no symlinks,
-/// so a write can never land outside the workspace. Reserved paths are refused outright.
+/// so a write can never land outside the workspace. Reserved paths are refused outright, and so
+/// is any component this platform would parse as more than one plain name (a separator, a drive
+/// or UNC prefix, `..`), whatever produced `rel`.
 pub fn guard_parents(root: &Path, rel: &str) -> Result<()> {
     if is_reserved(rel) {
         bail!("refusing to write reserved path {}", display(rel));
     }
-    let mut cur = root.to_path_buf();
     let comps: Vec<&str> = rel.split('/').collect();
+    for c in &comps {
+        let mut parsed = Path::new(c).components();
+        let single = matches!(parsed.next(), Some(std::path::Component::Normal(n)) if n == *c)
+            && parsed.next().is_none();
+        if !single || !valid_name(c) {
+            bail!("refusing to write {}: not a plain local name", display(rel));
+        }
+    }
+    let mut cur = root.to_path_buf();
     for c in &comps[..comps.len().saturating_sub(1)] {
         cur.push(c);
         match std::fs::symlink_metadata(&cur) {
@@ -3386,7 +3437,7 @@ mod tests {
     #[test]
     fn rejects_unmappable_remote_names() {
         assert!(valid_name("normal name.txt"));
-        assert!(valid_name("  spaces  "));
+        assert!(valid_name_on("  spaces  ", false));
         assert!(!valid_name("a/b"));
         assert!(!valid_name("."));
         assert!(!valid_name(".."));
@@ -3401,6 +3452,67 @@ mod tests {
         );
         assert!(!is_reserved(".gdx/file"));
         assert!(!is_reserved("normal/.hidden"));
+    }
+
+    #[test]
+    fn rejects_names_that_are_paths_on_windows() {
+        for name in [
+            "..\\..\\x",
+            "a\\b",
+            "C:\\Users\\x\\file",
+            "C:file",
+            "\\\\server\\share\\x",
+            "\\\\?\\C:\\x",
+            "file.txt:stream",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "tab\there",
+            "trailing.",
+            "trailing ",
+            ".. ",
+            "...",
+            "CON",
+            "con.txt",
+            "Nul",
+            "aux.tar.gz",
+            "PRN ",
+            "COM1",
+            "lpt9.log",
+            "COM¹",
+            "CONIN$",
+        ] {
+            assert!(!valid_name_on(name, true), "{name:?} accepted on Windows");
+        }
+        for name in [
+            "normal.txt",
+            "CONSOLE.txt",
+            "COM10",
+            "a.con",
+            ".hidden",
+            "café",
+        ] {
+            assert!(valid_name_on(name, true), "{name:?} rejected on Windows");
+        }
+        // Elsewhere these characters are ordinary parts of a single name.
+        for name in ["..\\..\\x", "C:\\x", "a:b", "what?", "CON"] {
+            assert!(valid_name_on(name, false), "{name:?} rejected on Unix");
+        }
+        assert_eq!(valid_rel("ok/..\\x"), !cfg!(windows));
+        assert!(!valid_rel("ok/.."));
+    }
+
+    #[test]
+    fn guard_parents_refuses_names_that_are_not_plain() {
+        let dir = tmpdir("plain");
+        assert!(guard_parents(&dir, "ok/file.txt").is_ok());
+        assert!(guard_parents(&dir, "a/../b").is_err());
+        assert!(guard_parents(&dir, "a//b").is_err());
+        #[cfg(windows)]
+        assert!(guard_parents(&dir, "..\\..\\escape.txt").is_err());
     }
 
     #[test]

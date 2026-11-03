@@ -2,9 +2,10 @@
 //! and payloads are synthetic; each test binds its own loopback port and workspace.
 use super::*;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -683,4 +684,74 @@ fn about_reports_account_and_storage() {
             storage_usage: Some(1234),
         }
     );
+}
+
+/// Pull the given ROOT listing through the real walk -> filter -> plan -> execute path into a
+/// fresh workspace whose `.gd/` already holds state, and return the workspace.
+fn pull_listing(children: Vec<Value>, nested: Vec<(&'static str, Vec<Value>)>) -> Dir {
+    let server = Server::start(move |r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/files") => {
+            let q = r.query("q").unwrap_or_default();
+            let files = nested
+                .iter()
+                .find(|(id, _)| q.contains(&format!("'{id}'")))
+                .map(|(_, f)| f.clone())
+                .unwrap_or_else(|| {
+                    if q.contains("'ROOT'") {
+                        children.clone()
+                    } else {
+                        vec![]
+                    }
+                });
+            Reply::json(json!({ "files": files }))
+        }
+        ("GET", _) if r.query("alt").as_deref() == Some("media") => Reply {
+            status: 200,
+            headers: String::new(),
+            body: "pwned".into(),
+        },
+        _ => Reply::status(404),
+    });
+    let root = Dir::new();
+    std::fs::create_dir_all(root.0.join(".gd")).unwrap();
+    std::fs::write(root.0.join(".gd/config.json"), b"{}").unwrap();
+    let drive = server.drive();
+    let mut remote = BTreeMap::new();
+    drive.walk("ROOT", "", -1, &mut remote).unwrap();
+    let ignore = sync::load_ignore(&root.0);
+    sync::filter_remote(&root.0, &ignore, &mut remote);
+    let local = sync::local_walk(&root.0, &root.0, -1, &ignore).unwrap();
+    let plan = sync::plan_pull(&local, &remote, false, &BTreeSet::new());
+    let cache = Cache::open(Path::new(":memory:")).unwrap();
+    let _ = sync::exec_pull(&drive, &cache, &root.0, plan.actions, 2);
+    root
+}
+
+fn media(id: &str, name: &str, parent: &str) -> Value {
+    let mut f = file(id, name, parent, false);
+    f["size"] = json!("5");
+    f["md5Checksum"] = json!(format!("{:x}", md5::compute("pwned")));
+    f
+}
+
+#[test]
+fn pull_never_writes_outside_workspace_via_name() {
+    let marker = format!("dsync_escape_{}.txt", std::process::id());
+    let outside = std::env::temp_dir().join(&marker);
+    let _ = std::fs::remove_file(&outside);
+    let names = [
+        format!("..\\..\\{marker}"),
+        format!("..\\{marker}"),
+        format!("{}", outside.display()).replace('/', "\\"),
+        format!("C:\\{marker}"),
+        format!("C:{marker}"),
+        format!("\\\\?\\C:\\{marker}"),
+        format!("\\\\server\\share\\{marker}"),
+    ];
+    for name in &names {
+        let root = pull_listing(vec![media("E", name, "ROOT")], vec![]);
+        assert!(!outside.exists(), "{name:?} escaped the workspace");
+        let parent_hit = root.0.parent().unwrap().join(&marker);
+        assert!(!parent_hit.exists(), "{name:?} escaped the workspace");
+    }
 }
