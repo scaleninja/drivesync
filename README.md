@@ -128,6 +128,10 @@ Options for `push`, `pull` and `diff`:
 
 Put gitignore-style patterns in `.driveignore` at the sync root to leave things out (`init` creates
 one with `.DS_Store` and `._*`). `.gd/`, symlinks and non-regular files are never synced.
+`.driveignore` itself syncs like any file, except that `pull` never replaces or deletes an existing
+local copy: it decides what `push` uploads, so anyone who can edit the Drive folder could otherwise
+make your next push upload what you meant to keep back. A differing Drive copy is reported as a
+skip; to adopt it, delete the local file and pull again.
 
 Exit status is 0 on success, 1 when `diff` found differences or `--dry-run` found changes, and 2
 on an error or when any transfer failed. Every error message ends with a stable code in brackets,
@@ -170,7 +174,7 @@ render its own text (`note` is English and may change; `reason` will not). Absen
 |---|---|
 | `modify` | `local_newer`, `remote_newer` (the source is newer), `forced_destination_newer` (`--force` overwrote a newer copy), `modified_same_mtime` (content differs at equal mtime) |
 | `conflict` | `local_newer`, `remote_newer` (the destination is newer), `modified_same_mtime`, `case_collision` |
-| `skip` | `native_doc_not_overwritten`, `native_doc_no_export`, `native_doc_not_trashed`, `type_mismatch` (folder on one side, file on the other), `type_mismatch_below` (under such a path; `--delete` only), `outside_sync` (exists locally as a symlink, special file or ignored folder; `--delete` only), `unreadable_folder` (under a local folder that could not be read; `--delete` only) |
+| `skip` | `native_doc_not_overwritten`, `native_doc_no_export`, `native_doc_not_trashed`, `type_mismatch` (folder on one side, file on the other), `type_mismatch_below` (under such a path; `--delete` only), `outside_sync` (exists locally as a symlink, special file or ignored folder; `--delete` only), `unreadable_folder` (under a local folder that could not be read; `--delete` only), `ignore_file_kept` (`pull` never replaces or deletes the local `.driveignore`) |
 | `error` | `unreadable` |
 
 Error codes, present in the `error` event and in brackets at the end of every text error:
@@ -284,7 +288,7 @@ The guards:
   must still have the size and mtime the plan saw, nothing is followed through a symlink, and a
   local folder is only removed when empty. Anything that changed in between is left alone and
   reported.
-- Never deleted: Google Docs, Sheets and Slides; names that collide only by case or Unicode
+- Never deleted: Google Docs, Sheets and Slides; the local `.driveignore` (on pull); names that collide only by case or Unicode
   normalization on a case-folding filesystem; anything below a path that is a folder on one side
   and a file on the other; anything below a local folder that could not be read; anything
   `.driveignore` excludes; and, on push, anything that exists locally in a form the sync does not
@@ -314,8 +318,8 @@ The guards:
 - Windows: the token and cache files in `.gd/` are not given restrictive permissions (there are no
   Unix mode bits), so rely on your user profile's ACLs. Paths longer than 260 characters are not
   supported unless long paths are enabled system-wide. Drive names that Windows forbids in file
-  names (`<>:"/\|?*`, or reserved names such as `CON`) cannot be pulled and are reported as
-  failures. Only an x86_64 build is published.
+  names (`<>:"/\|?*` or control characters, a trailing dot or space, or device names such as `CON`
+  or `nul.txt`) cannot be pulled and are skipped with an `unmappable` warning. Only an x86_64 build is published.
 - Filesystem nuances: on macOS and other case-folding filesystems, names that differ only by case or
   Unicode normalization are one local file, so such pairs are reported as collisions and never
   transferred (HFS+ stores accented names in NFD form, which can trigger this for names created on

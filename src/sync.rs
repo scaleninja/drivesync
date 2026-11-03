@@ -743,6 +743,7 @@ pub enum Reason {
     TypeMismatchBelow,
     OutsideSync,
     UnreadableFolder,
+    IgnoreFileKept,
     // error
     Unreadable,
 }
@@ -762,6 +763,7 @@ impl Reason {
             Reason::TypeMismatchBelow => "type_mismatch_below",
             Reason::OutsideSync => "outside_sync",
             Reason::UnreadableFolder => "unreadable_folder",
+            Reason::IgnoreFileKept => "ignore_file_kept",
             Reason::Unreadable => "unreadable",
         }
     }
@@ -915,6 +917,13 @@ pub fn plan_push(
     plan
 }
 
+/// `.driveignore` decides what push uploads, so whoever can edit the Drive folder must not be able
+/// to change it locally: pull never replaces or deletes an existing local copy, even with
+/// `--force` (an emptied ignore file would make the next push upload what it used to keep back).
+/// Pulling it where none exists only adds rules.
+const IGNORE_FILE_KEPT: &str =
+    "pull never replaces the local .driveignore; to adopt the Drive copy, delete the local one and pull again";
+
 /// Plan a pull.
 pub fn plan_pull(
     local: &BTreeMap<String, Entry>,
@@ -950,6 +959,12 @@ pub fn plan_pull(
                 Reason::NativeDocNoExport,
                 "Google-native document; export not supported",
             ));
+        } else if l.is_some() && path == IGNORE_FILE {
+            // Differs at all (whichever side is newer): reported, never transferred.
+            if needs_transfer(r, l, true, path, "local", &mut Plan::default()).is_some() {
+                plan.skips
+                    .push(Skip::new(path, Reason::IgnoreFileKept, IGNORE_FILE_KEPT));
+            }
         } else if needs_transfer(r, l, force, path, "local", &mut plan).is_some() {
             plan.actions.push(Action::Download {
                 path: path.clone(),
@@ -1019,6 +1034,14 @@ pub fn plan_deletions(
                 path,
                 Reason::TypeMismatchBelow,
                 "below a path that is a folder on one side and a file on the other; not deleted",
+            ));
+            continue;
+        }
+        if on == Side::Local && path == IGNORE_FILE {
+            skips.push(Skip::new(
+                path,
+                Reason::IgnoreFileKept,
+                "pull never removes the local .driveignore; not deleted",
             ));
             continue;
         }
@@ -3719,6 +3742,50 @@ mod tests {
             id: Some(id.into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pull_never_replaces_or_removes_the_local_ignore_file() {
+        let ignore = IGNORE_FILE.to_string();
+        let mut newer = remote_entry("I", false, 5);
+        newer.mtime_ms = 9_000_000;
+        let local: BTreeMap<_, _> = [(ignore.clone(), sized(1_000_000, 40))].into();
+        let remote: BTreeMap<_, _> = [(ignore.clone(), newer.clone())].into();
+        for force in [false, true] {
+            let plan = plan_pull(&local, &remote, force, &none());
+            assert!(plan.actions.is_empty(), "force={force}");
+            assert_eq!(plan.skips.len(), 1);
+            assert_eq!(plan.skips[0].reason, Reason::IgnoreFileKept);
+        }
+        // Remote older than the local copy: still a skip, not a conflict --force could override.
+        let mut older = newer.clone();
+        older.mtime_ms = 1;
+        let plan = plan_pull(&local, &[(ignore.clone(), older)].into(), true, &none());
+        assert!(plan.actions.is_empty() && plan.conflicts.is_empty());
+        assert_eq!(plan.skips[0].reason, Reason::IgnoreFileKept);
+        // Identical content: nothing to say.
+        let mut same = sized(1_000_000, 40);
+        same.md5 = Some("m".into());
+        let mut remote_same = remote_entry("I", false, 40);
+        remote_same.md5 = Some("m".into());
+        let plan = plan_pull(
+            &[(ignore.clone(), same)].into(),
+            &[(ignore.clone(), remote_same)].into(),
+            true,
+            &none(),
+        );
+        assert_eq!(plan, Plan::default());
+        // No local copy: adopting the Drive one only adds rules.
+        let plan = plan_pull(&BTreeMap::new(), &remote, false, &none());
+        assert!(matches!(&plan.actions[..], [Action::Download { path, .. }] if *path == ignore));
+        // --delete on pull keeps it; on push a missing local copy may still trash the Drive one.
+        let no_root = PathBuf::from("/nonexistent/dsync-plan-test");
+        let (pull, skips) =
+            plan_deletions(&no_root, &local, &BTreeMap::new(), &none(), Side::Local);
+        assert!(pull.is_empty());
+        assert_eq!(skips[0].reason, Reason::IgnoreFileKept);
+        let (push, _) = plan_deletions(&no_root, &BTreeMap::new(), &remote, &none(), Side::Remote);
+        assert_eq!(push.len(), 1);
     }
 
     #[test]
