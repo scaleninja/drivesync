@@ -205,11 +205,12 @@ pub fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
 }
 
-/// Printable form of a path: control characters are escaped so untrusted names cannot drive the terminal.
+/// Printable form of a path: control and bidirectional formatting characters are escaped so
+/// untrusted names can neither drive the terminal nor disguise themselves (see `needs_escape`).
 pub fn display(path: &str) -> String {
     path.chars()
         .map(|c| {
-            if c.is_control() {
+            if output::needs_escape(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()
@@ -3245,6 +3246,16 @@ mod tests {
             line("+", "evil\x1b[31mname\n.txt", ""),
             "+ evil\\u{1b}[31mname\\n.txt",
             "control characters never reach the terminal"
+        );
+        assert_eq!(
+            line("+", "invoice\u{202e}fdp.exe", ""),
+            "+ invoice\\u{202e}fdp.exe",
+            "bidi overrides cannot disguise a name"
+        );
+        assert_eq!(
+            output::terminal_safe("x failed   a: b\u{1b}]0;t\u{7}\u{2067}c\n\tnext"),
+            "x failed   a: b\\u{1b}]0;t\\u{7}\\u{2067}c\n\tnext",
+            "error text is escaped too; layout newlines and tabs are kept"
         );
         assert!(parse_answer(Some("\n"), true));
         assert!(!parse_answer(Some("\n"), false));

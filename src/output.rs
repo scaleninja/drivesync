@@ -19,6 +19,28 @@ pub fn json_mode() -> bool {
     JSON_MODE.load(Ordering::SeqCst)
 }
 
+/// Characters a terminal must never receive from an untrusted name: control characters (escape
+/// sequences, carriage returns) and the bidirectional formatting characters, which reorder what
+/// follows them so that `invoice\u{202e}fdp.exe` reads as `invoiceexe.pdf`.
+pub fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `text` as it may reach a terminal: every character `needs_escape` flags is shown escaped,
+/// except the newlines and tabs of dsync's own layout.
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if needs_escape(c) && c != '\n' && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Print one event line. Only meaningful in JSON mode; callers that have no human
 /// equivalent (byte progress, phases) check [`json_mode`] first.
 pub fn emit(event: Value) {
@@ -30,7 +52,7 @@ pub fn out(event: Value, human: impl FnOnce() -> String) {
     if json_mode() {
         emit(event);
     } else {
-        crate::progress::println(&human());
+        crate::progress::println(&terminal_safe(&human()));
     }
 }
 
@@ -39,7 +61,7 @@ pub fn err(event: Value, human: impl FnOnce() -> String) {
     if json_mode() {
         emit(event);
     } else {
-        crate::progress::eprintln(&human());
+        crate::progress::eprintln(&terminal_safe(&human()));
     }
 }
 
@@ -211,7 +233,7 @@ pub fn fatal(e: &anyhow::Error) {
         }
         emit(event);
     } else {
-        eprintln!("error: {message} [{}]", code.as_str());
+        eprintln!("error: {} [{}]", terminal_safe(&message), code.as_str());
     }
 }
 
