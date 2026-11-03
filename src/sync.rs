@@ -218,10 +218,21 @@ pub fn display(path: &str) -> String {
         .collect()
 }
 
-/// Paths dsync owns or must never write: anything under `.gd/` and download temp files.
+/// Paths dsync owns or must never write: anything under `.gd/` and download temp files. Matched
+/// in every spelling a filesystem may resolve to the same entry (`.GD` on macOS and Windows,
+/// `.gd.` on Windows, `.g\u{200c}d` on HFS+), not just the canonical one.
 pub fn is_reserved(rel: &str) -> bool {
     rel.split('/')
+        .map(alias_form)
         .any(|c| c == GD_DIR || c.ends_with(PART_SUFFIX))
+}
+
+/// The form a component takes once the aliasing filesystems apply is undone: case folded and NFC
+/// (macOS, Windows), the code points HFS+ ignores removed, trailing dots and spaces dropped (Win32).
+fn alias_form(component: &str) -> String {
+    let hfs_ignorable = |c: char| matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
+    let kept: String = component.chars().filter(|&c| !hfs_ignorable(c)).collect();
+    fold(kept.trim_end_matches(['.', ' ']))
 }
 
 /// Normalize `path` (relative to cwd) to an absolute path without touching the filesystem.
@@ -1569,6 +1580,12 @@ pub fn guard_parents(root: &Path, rel: &str) -> Result<()> {
         if !single || !valid_name(c) {
             bail!("refusing to write {}: not a plain local name", display(rel));
         }
+    }
+    // A name the filesystem resolves to the state folder under another spelling (an NTFS 8.3
+    // short name such as `GD~1`, or any case or normalization variant not caught above).
+    let top = root.join(comps[0]);
+    if same_file::is_same_file(&top, root.join(GD_DIR)).unwrap_or(false) {
+        bail!("refusing to write reserved path {}", display(rel));
     }
     let mut cur = root.to_path_buf();
     for c in &comps[..comps.len().saturating_sub(1)] {
@@ -3506,6 +3523,25 @@ mod tests {
     }
 
     #[test]
+    fn reserved_paths_match_every_alias() {
+        for rel in [
+            ".GD",
+            ".Gd/config.json",
+            "x/.gD/y",
+            ".gd.",
+            ".gd /x",
+            ".g\u{200c}d/x",
+            "\u{feff}.gd",
+            "x/.y.DSYNC-PART",
+            "x/.y.dsync-part.",
+        ] {
+            assert!(is_reserved(rel), "{rel:?} not reserved");
+        }
+        assert!(!is_reserved(".gdx/file"));
+        assert!(!is_reserved("g.d"));
+    }
+
+    #[test]
     fn guard_parents_refuses_names_that_are_not_plain() {
         let dir = tmpdir("plain");
         assert!(guard_parents(&dir, "ok/file.txt").is_ok());
@@ -3513,6 +3549,21 @@ mod tests {
         assert!(guard_parents(&dir, "a//b").is_err());
         #[cfg(windows)]
         assert!(guard_parents(&dir, "..\\..\\escape.txt").is_err());
+    }
+
+    #[test]
+    fn guard_parents_refuses_state_folder_aliases() {
+        let dir = tmpdir("gdalias");
+        std::fs::create_dir_all(dir.join(GD_DIR)).unwrap();
+        assert!(guard_parents(&dir, "ok/file.txt").is_ok());
+        assert!(guard_parents(&dir, ".GD/planted").is_err());
+        // An entry the filesystem resolves to `.gd` under a name no rule knows (on Windows, an 8.3
+        // short name like `GD~1`) is caught by identity; a symlink stands in for one here.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join(GD_DIR), dir.join("GD~1")).unwrap();
+            assert!(guard_parents(&dir, "GD~1").is_err());
+        }
     }
 
     #[test]

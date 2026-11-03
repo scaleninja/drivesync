@@ -735,6 +735,23 @@ fn media(id: &str, name: &str, parent: &str) -> Value {
 }
 
 #[test]
+fn pull_never_writes_into_state_dir_under_another_spelling() {
+    // On a case-insensitive filesystem (macOS, Windows) `.GD` is the workspace's `.gd`; on
+    // Windows `.gd.` and `.gd ` are too, since Win32 strips trailing dots and spaces.
+    for (n, name) in [".GD", ".Gd", ".gd.", ".gd "].into_iter().enumerate() {
+        let dir_id: &'static str = Box::leak(format!("G{n}").into_boxed_str());
+        let root = pull_listing(
+            vec![file(dir_id, name, "ROOT", true)],
+            vec![(dir_id, vec![media("P", "planted.json", dir_id)])],
+        );
+        assert!(
+            !root.0.join(".gd/planted.json").exists(),
+            "{name:?}/planted.json landed in .gd/"
+        );
+    }
+}
+
+#[test]
 fn pull_never_writes_outside_workspace_via_name() {
     let marker = format!("dsync_escape_{}.txt", std::process::id());
     let outside = std::env::temp_dir().join(&marker);

@@ -293,6 +293,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "trash",
