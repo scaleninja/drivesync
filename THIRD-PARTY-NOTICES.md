@@ -115,7 +115,7 @@ A crate that applies to only some of them is still listed; the set is the union.
 | potential_utf | 0.1.6 | Unicode-3.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
-| quinn-proto | 0.11.17 | MIT OR Apache-2.0 |
+| quinn-proto | 0.11.19 | MIT OR Apache-2.0 |
 | quinn-udp | 0.5.15 | MIT OR Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
 | rand | 0.10.2 | MIT OR Apache-2.0 |
@@ -128,9 +128,9 @@ A crate that applies to only some of them is still listed; the set is the union.
 | rusqlite | 0.32.1 | MIT |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
-| rustls-webpki | 0.103.15 | ISC |
+| rustls-webpki | 0.103.16 | ISC |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |
@@ -155,7 +155,7 @@ A crate that applies to only some of them is still listed; the set is the union.
 | tinystr | 0.8.4 | Unicode-3.0 |
 | tinyvec | 1.13.2 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tokio | 1.53.1 | MIT |
+| tokio | 1.54.1 | MIT |
 | tokio-rustls | 0.26.5 | MIT OR Apache-2.0 |
 | tokio-util | 0.7.18 | MIT |
 | tower | 0.5.3 | MIT |
@@ -177,7 +177,7 @@ A crate that applies to only some of them is still listed; the set is the union.
 | version_check | 0.9.5 | MIT/Apache-2.0 |
 | walkdir | 2.5.0 | Unlicense/MIT |
 | want | 0.3.1 | MIT |
-| webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
+| webpki-roots | 1.0.11 | CDLA-Permissive-2.0 |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | windows | 0.62.2 | MIT OR Apache-2.0 |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 |
@@ -1364,7 +1364,7 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to:
 
-- tokio 1.53.1
+- tokio 1.54.1
 - tokio-util 0.7.18
 
 ```
@@ -2659,7 +2659,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 Applies to:
 
 - quinn 0.11.11
-- quinn-proto 0.11.17
+- quinn-proto 0.11.19
 - quinn-udp 0.5.15
 
 ```
@@ -3045,7 +3045,7 @@ THE SOFTWARE.
 
 Applies to:
 
-- rustls-webpki 0.103.15
+- rustls-webpki 0.103.16
 
 ```
 Except as otherwise noted, this project is licensed under the following
@@ -4212,7 +4212,7 @@ SOFTWARE.
 Applies to:
 
 - hyper-rustls 0.27.9
-- rustls 0.23.45
+- rustls 0.23.46
 
 ```
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -4582,7 +4582,7 @@ DEALINGS IN THE SOFTWARE.
 Applies to:
 
 - hyper-rustls 0.27.9
-- rustls 0.23.45
+- rustls 0.23.46
 
 ```
 ISC License (ISC)
@@ -6223,7 +6223,7 @@ Applies to:
 - regex-automata 0.4.18
 - regex-syntax 0.8.11
 - rustix 1.1.4
-- rustls 0.23.45
+- rustls 0.23.46
 - scopeguard 1.2.0
 - smallvec 1.16.0
 - socket2 0.6.5
@@ -7708,7 +7708,7 @@ Applies to:
 Applies to:
 
 - quinn 0.11.11
-- quinn-proto 0.11.17
+- quinn-proto 0.11.19
 - quinn-udp 0.5.15
 
 ```
@@ -8664,7 +8664,7 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to:
 
-- webpki-roots 1.0.9
+- webpki-roots 1.0.11
 
 ```
 # Community Data License Agreement - Permissive - Version 2.0
